@@ -1,0 +1,21 @@
+# Oracle corruption diagnostic, not end-to-end prompt recovery. Never auto-launched.
+adapter_config: adapter.yaml
+seed: 42
+modes: [encoder, projected]
+num_prompts: 50
+corruption_counts: [1, 2, 4, 8]
+corruption_trials: 3
+selection:
+  policy: first_16_editable_preserve_all_specials
+  editable_tokens: 16
+  max_text_characters: 10000
+precision: float32
+matmul_precision: highest
+attack:
+  k: 16
+  candidate_batch_size: 8
+  max_iterations: 100
+  max_candidate_evaluations: 25600
+  stopping_loss_tolerance: 1.0e-8
+  acceptance_atol: 1.0e-8
+  acceptance_rtol: 1.0e-6

@@ -1,0 +1,21 @@
+# Two prompts, one seeded k=1 trial each. One complete top-K iteration per mode.
+adapter_config: adapter.yaml
+seed: 42
+modes: [encoder, projected]
+num_prompts: 2
+corruption_counts: [1]
+corruption_trials: 1
+selection:
+  policy: first_16_editable_preserve_all_specials
+  editable_tokens: 16
+  max_text_characters: 10000
+precision: float32
+matmul_precision: highest
+attack:
+  k: 16
+  candidate_batch_size: 4
+  max_iterations: 1
+  max_candidate_evaluations: 256
+  stopping_loss_tolerance: 1.0e-8
+  acceptance_atol: 1.0e-8
+  acceptance_rtol: 1.0e-6
