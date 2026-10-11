@@ -3,7 +3,7 @@ requires = ["setuptools>=69.5.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "elf-stage-b"
+name = "elf-prompt-inversion"
 version = "0.1.0"
 description = "Native ELF prompt inversion forward adapter and equivalence checks"
 requires-python = ">=3.10,<3.13"
@@ -19,4 +19,4 @@ dependencies = [
 test = ["torch==2.3.0", "datasets>=2.19"]
 
 [tool.setuptools.packages.find]
-include = ["stage_b*"]
+include = ["prompt_inversion*"]

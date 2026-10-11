@@ -1,0 +1,24 @@
+# Small workload for stepping through projected inversion in VS Code.
+# The complete prompt remains editable; reduce candidates/iterations for debugging.
+adapter_config: adapter.yaml
+seed: 42
+modes: [projected]
+num_prompts: 1
+corruption_counts: [all]
+corruption_trials: 1
+selection:
+  policy: full_prompt_preserve_all_specials
+  max_text_characters: 10000
+precision: float32
+matmul_precision: highest
+logging:
+  progress_interval_seconds: 10
+  profile: true
+attack:
+  k: 2
+  candidate_batch_size: 2
+  max_iterations: 1
+  max_candidate_evaluations: 128
+  stopping_loss_tolerance: 1.0e-8
+  acceptance_atol: 1.0e-8
+  acceptance_rtol: 1.0e-6

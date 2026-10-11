@@ -1,0 +1,25 @@
+# Keep the complete prompt (up to ELF's 64-token conditioning limit).
+# Replace EVERY non-special token; true length and explicit special layout remain known.
+adapter_config: adapter.yaml
+seed: 42
+modes: [projected]
+num_prompts: 2
+corruption_counts: [all]
+corruption_trials: 1
+selection:
+  policy: full_prompt_preserve_all_specials
+  max_text_characters: 10000
+precision: float32
+matmul_precision: highest
+logging:
+  progress_interval_seconds: 10
+  profile: false
+attack:
+  k: 84
+  candidate_batch_size: 4
+  max_iterations: 50
+  # Covers all 50 iterations even at 64 editable positions and 84 candidates each.
+  max_candidate_evaluations: 409600
+  stopping_loss_tolerance: 1.0e-8
+  acceptance_atol: 1.0e-8
+  acceptance_rtol: 1.0e-6

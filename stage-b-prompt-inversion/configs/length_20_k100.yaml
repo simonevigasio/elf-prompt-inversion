@@ -1,0 +1,25 @@
+# Fifty complete prompts of exactly 20 tokenizer tokens, with all editable tokens corrupted.
+adapter_config: adapter.yaml
+seed: 42
+modes: [projected]
+num_prompts: 50
+corruption_counts: [all]
+corruption_trials: 1
+selection:
+  policy: full_prompt_preserve_all_specials
+  exact_token_count: 20
+  max_text_characters: 10000
+precision: float32
+matmul_precision: highest
+logging:
+  progress_interval_seconds: 10
+  profile: false
+attack:
+  k: 100
+  candidate_batch_size: 4
+  max_iterations: 50
+  # 20 positions * 100 candidates * 50 iterations per trial.
+  max_candidate_evaluations: 100000
+  stopping_loss_tolerance: 1.0e-8
+  acceptance_atol: 1.0e-8
+  acceptance_rtol: 1.0e-6

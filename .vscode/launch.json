@@ -1,0 +1,59 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Projected: debug ricerca (JIT)",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/stage-b-prompt-inversion/.venv/bin/python",
+      "program": "${workspaceFolder}/stage-b-prompt-inversion/scripts/run_pilot.py",
+      "cwd": "${workspaceFolder}/stage-b-prompt-inversion",
+      "args": [
+        "run",
+        "--config", "configs/debug_projected.yaml",
+        "--dataset", "examples/smoke.jsonl",
+        "--output", "${input:debugOutput}",
+        "--modes", "projected"
+      ],
+      "env": {
+        "JAX_PLATFORMS": "cpu",
+        "JAX_DISABLE_JIT": "0",
+        "TOKENIZERS_PARALLELISM": "false",
+        "PYTHONDONTWRITEBYTECODE": "1"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "Projected: debug forward (senza JIT)",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/stage-b-prompt-inversion/.venv/bin/python",
+      "program": "${workspaceFolder}/stage-b-prompt-inversion/scripts/run_pilot.py",
+      "cwd": "${workspaceFolder}/stage-b-prompt-inversion",
+      "args": [
+        "run",
+        "--config", "configs/debug_projected.yaml",
+        "--dataset", "examples/smoke.jsonl",
+        "--output", "${input:debugOutput}",
+        "--modes", "projected"
+      ],
+      "env": {
+        "JAX_PLATFORMS": "cpu",
+        "JAX_DISABLE_JIT": "1",
+        "TOKENIZERS_PARALLELISM": "false",
+        "PYTHONDONTWRITEBYTECODE": "1"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": false
+    }
+  ],
+  "inputs": [
+    {
+      "id": "debugOutput",
+      "type": "promptString",
+      "description": "Cartella risultati relativa a stage-b-prompt-inversion: scegli un nuovo nome per rieseguire i trial",
+      "default": "outputs/debug-projected-01"
+    }
+  ]
+}

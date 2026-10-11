@@ -8,10 +8,10 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 import jax.numpy as jnp
 import numpy as np
 
-from stage_b.attack import (AttackConfig, Replacement, attack, candidate_token_batches,
+from prompt_inversion.attack import (AttackConfig, Replacement, attack, candidate_token_batches,
                             exhaustive_single_token_neighborhood, shortlist_replacements)
-from stage_b.data import corrupt_tokens
-from stage_b.elf_adapter import PromptBatch
+from prompt_inversion.data import corrupt_tokens
+from prompt_inversion.elf_adapter import PromptBatch
 
 
 class TinyTokenizer:
@@ -67,6 +67,9 @@ class TinyModel:
 
     def reconstruction_loss(self, embeddings, batch, target, mode="encoder"):
         return jnp.mean((self.encode_embeddings(embeddings, batch, mode) - target) ** 2)
+
+    def project(self, codes):
+        return 2 * codes + 0.25
 
     def target(self, tokens, mode="encoder"):
         return self.encode_token_ids(self.prepare_token_ids(tokens), mode)
@@ -250,10 +253,41 @@ class AttackTests(unittest.TestCase):
         self.assertFalse(result.diagnostic.complete)
         np.testing.assert_array_equal(result.tokens, result.diagnostic.center_tokens)
 
+    def test_profiled_losses_preserve_search_and_measure_each_position(self):
+        model = TinyModel()
+        for mode in ("encoder", "projected"):
+            events = []
+            target = model.target([3, 3], mode)
+            plain = attack(target, [2, 2], model, AttackConfig(mode=mode, k=2, max_iterations=1))
+            measured = attack(target, [2, 2], model,
+                AttackConfig(mode=mode, k=2, candidate_batch_size=3, max_iterations=1,
+                             warmup=True, profile=True),
+                progress=lambda event, message, **fields: events.append({"event": event, **fields}))
+            np.testing.assert_array_equal(measured.tokens, plain.tokens)
+            np.testing.assert_allclose(measured.loss_history, plain.loss_history)
+            self.assertEqual(measured.counters.candidate_evaluations, plain.counters.candidate_evaluations)
+            records = measured.stage_timings
+            search = [r for r in records if r["phase"] == "search"]
+            forward = [r for r in search if r["stage"] == "encoder_forward"]
+            self.assertEqual(sum(r["sequences"] for r in forward), 1 + measured.counters.candidate_evaluations)
+            self.assertEqual({r["position"] for r in forward if r["iteration"] == 1}, {0, 1})
+            self.assertTrue(all(r["seconds"] >= 0 and r["calls"] > 0 for r in records))
+            self.assertTrue(any(r["phase"] == "warmup" for r in records))
+            self.assertEqual(any(r["stage"] == "projection" for r in search), mode == "projected")
+            self.assertTrue(any(r["stage"] == "input_gradient" for r in search))
+            progress = [e for e in events if e["event"] == "candidate_progress"]
+            self.assertEqual(progress[-1]["candidates_done"], measured.counters.candidate_evaluations)
+            self.assertEqual(progress[-1]["eta_seconds"], 0)
+            positions = [e for e in events if e["event"] == "position_done"]
+            self.assertEqual({e["position"] for e in positions}, {0, 1})
+            self.assertTrue(all(e["stage_timings"] and e["candidates_done"] == 2 for e in positions))
+            self.assertEqual(events[-1]["event"], "attack_done")
+
     def test_configuration_and_target_validation(self):
         for kwargs in ({"k": 0}, {"candidate_batch_size": 0}, {"max_iterations": -1},
                        {"max_candidate_evaluations": 1.5}, {"mode": "invalid"},
-                       {"acceptance_atol": float("nan")}, {"stopping_loss_tolerance": -1}):
+                       {"acceptance_atol": float("nan")}, {"stopping_loss_tolerance": -1}, {"profile": "yes"},
+                       {"progress_interval_seconds": 0}, {"progress_interval_seconds": float("inf")}):
             with self.assertRaises(ValueError):
                 AttackConfig(**kwargs)
         model = TinyModel()

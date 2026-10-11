@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from stage_b.elf_adapter import ELFAdapter, PROJECT_ROOT, native_modules, read_settings
+from prompt_inversion.elf_adapter import ELFAdapter, PROJECT_ROOT, native_modules, read_settings
 
 
 class TinyTokenizer:
@@ -133,6 +133,18 @@ class EquivalenceChecks:
 
 
 class SyntheticEquivalence(EquivalenceChecks, unittest.TestCase):
+    def test_profiled_encoder_and_projection_match_fused_losses(self):
+        from prompt_inversion.attack import _Evaluator
+
+        model = self.adapter
+        tokens = np.array([[3, 4, 5, 6], [6, 7, 8, 9]], dtype=np.int32)
+        batch = model.prepare_token_ids(tokens[:1])
+        for mode in ("encoder", "projected"):
+            target = model.encode_token_ids(batch, mode=mode)
+            fused = _Evaluator(model, target, batch, mode)
+            profiled = _Evaluator(model, target, batch, mode, profile=True)
+            self.assert_close(profiled.losses(tokens), fused.losses(tokens), "profiled " + mode + " losses")
+
     @classmethod
     def setUpClass(cls):
         cls.adapter = tiny_adapter()

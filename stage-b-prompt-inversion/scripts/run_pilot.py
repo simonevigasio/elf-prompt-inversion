@@ -9,9 +9,6 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from stage_b.evaluate import run_evaluation, summarize
-
-
 def main():
     parser = argparse.ArgumentParser(description="Oracle-corruption diagnostic, not end-to-end prompt recovery")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -25,9 +22,14 @@ def main():
     summary.add_argument("--output", required=True)
     args = parser.parse_args()
     if args.command == "run":
+        from prompt_inversion.evaluate import run_evaluation
+
         run_evaluation(args.config, args.dataset, args.output, modes=args.modes)
     else:
+        from prompt_inversion.results import summarize, write_timings
+
         rows = summarize(args.results, args.output)
+        write_timings(args.results, Path(args.output).with_name("timings.csv"))
         print(f"Wrote {len(rows)} summary groups to {args.output}")
 
 

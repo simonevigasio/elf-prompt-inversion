@@ -17,24 +17,24 @@ import numpy as np
 import yaml
 
 Mode = Literal["encoder", "projected"]
-PROJECT_ROOT = Path(__file__).resolve().parents[1] # absolute path to stage-b-tests
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def native_modules(root: Path, expected_commit: str | None = None):
     """Import upstream read-only; reject ambiguous imports or changed tracked source."""
-    
-    root = root.resolve() 
+
+    root = root.resolve()
     if expected_commit:
-        commit = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip() 
-        if commit != expected_commit: 
+        commit = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
+        if commit != expected_commit:
             raise ValueError(f"ELF commit mismatch: {commit} != {expected_commit}")
         if subprocess.check_output(["git", "-C", str(root), "diff", "HEAD", "--", "src"], text=True):
             raise ValueError("ELF tracked source differs from the pinned commit")
-        
+
     src = root / "src"
     if not (src / "modules/t5_encoder.py").is_file():
         raise FileNotFoundError(f"ELF source missing at {src}")
-    
+
     for name, module in tuple(sys.modules.items()):
         if name.split(".")[0] in {"modules", "utils", "configs"}:
             paths = list(getattr(module, "__path__", []))
@@ -46,7 +46,7 @@ def native_modules(root: Path, expected_commit: str | None = None):
             if ((concrete and not Path(concrete).resolve().is_relative_to(src)) or
                     (not concrete and paths and not any(Path(p).resolve().is_relative_to(src) for p in paths))):
                 raise RuntimeError(f"Import namespace {name} is already occupied by non-ELF code")
-            
+
     sys.dont_write_bytecode = True  # Do not create __pycache__ in the ELF checkout.
     if str(src) not in sys.path:
         sys.path.insert(0, str(src))
@@ -86,7 +86,7 @@ class ELFAdapter:
     def __init__(self, *, native, config, tokenizer, encoder, encoder_params,
                  prompt_length, filler_token_ids, model=None, model_params=None,
                  provenance=None):
-        
+
         self.native, self.config, self.tokenizer = native, config, tokenizer
         self.encoder = encoder
         self.encoder_params = frozen_params(encoder_params)
@@ -105,7 +105,7 @@ class ELFAdapter:
         self.pad_token_id = tokenizer.eos_token_id if config.pad_token == "eos" else tokenizer.pad_token_id
         if self.pad_token_id is None:
             raise ValueError("Missing configured padding token")
-        
+
         ec = encoder.config
         self.stack = native["t5"].T5EncoderLikeStack(**{
             key: getattr(ec, key) for key in (
@@ -132,7 +132,7 @@ class ELFAdapter:
 
         with open(root / settings["elf_config"]) as f:
             cfg_dict = yaml.safe_load(f)
-            
+
         config = native["config"].Config()
         # Same Config defaults + YAML overrides as upstream, without loading sampling
         # schedules relative to cwd; no sampler or training state is needed here.
@@ -148,7 +148,8 @@ class ELFAdapter:
         tokenizer = AutoTokenizer.from_pretrained(
             tok_spec["repo"], revision=tok_spec["revision"], local_files_only=offline,
         )
-        enc_path = hf_hub_download(**enc_spec_to_hub(enc_spec), local_files_only=offline)
+        enc_path = hf_hub_download(repo_id=enc_spec["repo"], revision=enc_spec["revision"],
+                                   filename=enc_spec["filename"], local_files_only=offline)
         ec, encoder, _ = native["t5"].get_encoder(config.encoder_model_name, jnp.float32)
         enc_params = native["checkpoint"].load_encoder_checkpoint(enc_path)
         provenance = {"elf_commit": settings["elf_commit"], "tokenizer": tok_spec,
@@ -178,8 +179,6 @@ class ELFAdapter:
             required = {"params", spec["parameters"], "step", "epoch"}
             if not isinstance(state, dict) or not required.issubset(state):
                 raise ValueError(f"Invalid ELF inference checkpoint; required keys: {sorted(required)}")
-            if spec["parameters"] not in state:
-                raise ValueError(f"Checkpoint missing explicit parameter set {spec['parameters']}")
             params = state[spec["parameters"]]  # ELF generation uses EMA, not raw params.
             provenance.update(denoiser=spec, checkpoint_path=ckpt_path,
                               step=int(state["step"]), epoch=float(state["epoch"]))
@@ -340,7 +339,3 @@ class ELFAdapter:
         if prediction.shape != target.shape:
             raise ValueError("Target shape must exactly match the prompt representation")
         return jnp.mean(jnp.square(prediction - jax.lax.stop_gradient(target)))
-
-
-def enc_spec_to_hub(spec):
-    return {"repo_id": spec["repo"], "revision": spec["revision"], "filename": spec["filename"]}

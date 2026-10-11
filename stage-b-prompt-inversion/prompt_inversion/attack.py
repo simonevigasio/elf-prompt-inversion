@@ -5,6 +5,7 @@ One attack handles one prompt. Targets are [1, length, dimension] (or
 No ground-truth tokens or corruption locations are accepted by this module.
 """
 from dataclasses import dataclass, replace
+from itertools import groupby
 from time import perf_counter
 from typing import Iterable, Literal
 
@@ -13,6 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from .data import allowed_vocabulary, single_prompt
+from .profiling import StageTimings, duration
 
 
 @dataclass(frozen=True)
@@ -29,8 +31,15 @@ class AttackConfig:
     exhaustive_diagnostic: bool = False
     warmup: bool = False
     record_shortlists: bool = False
+    profile: bool = False
+    progress_interval_seconds: float = 10.0
 
     def __post_init__(self):
+        if type(self.profile) is not bool:
+            raise ValueError("profile must be a boolean")
+        if (type(self.progress_interval_seconds) not in (int, float) or
+                not np.isfinite(self.progress_interval_seconds) or self.progress_interval_seconds <= 0):
+            raise ValueError("progress_interval_seconds must be finite and positive")
         if self.mode not in ("encoder", "projected"):
             raise ValueError("mode must be encoder or projected")
         for name in ("k", "candidate_batch_size", "max_iterations", "max_candidate_evaluations"):
@@ -104,6 +113,7 @@ class AttackResult:
     diagnostic: NeighborhoodDiagnostic | None = None
     warmup_seconds: float = 0.0
     shortlists: tuple[tuple[Replacement, ...], ...] = ()
+    stage_timings: tuple[dict, ...] = ()
 
     @property
     def final_loss(self):
@@ -111,7 +121,7 @@ class AttackResult:
 
 
 def shortlist_replacements(tokens, editable_positions, embedding_table, gradients,
-                           allowed_token_ids, k: int) -> list[Replacement]:
+                           allowed_token_ids, k: int, *, timings=None) -> list[Replacement]:
     """Top K at *each* position; score ties use token ID, output order uses position/ID.
 
     Gradients are [prompt_length, embedding_dimension]. Only a vocabulary-sized
@@ -125,11 +135,20 @@ def shortlist_replacements(tokens, editable_positions, embedding_table, gradient
             continue
         grad = gradients[position]
         # Subtracting the current dot product avoids a [vocab, d_model] delta array.
-        scores = np.asarray(embedding_table[ids] @ grad - embedding_table[tokens[position]] @ grad)
+        if timings is None:
+            scores = np.asarray(embedding_table[ids] @ grad - embedding_table[tokens[position]] @ grad)
+            selected = np.lexsort((ids, scores))[:k]
+        else:
+            timings.position = int(position)
+            with timings.measure("embedding_scores", sequences=len(ids)):
+                scores = np.asarray(embedding_table[ids] @ grad - embedding_table[tokens[position]] @ grad)
+            with timings.measure("shortlist_selection"):
+                selected = np.lexsort((ids, scores))[:k]
         if not np.isfinite(scores).all():
             raise FloatingPointError("Non-finite replacement scores")
-        selected = np.lexsort((ids, scores))[:k]
         candidates.extend(Replacement(int(position), int(ids[i]), float(scores[i])) for i in selected)
+    if timings is not None:
+        timings.position = None
     return sorted(candidates, key=lambda c: (c.position, c.token))
 
 
@@ -160,7 +179,9 @@ def _strict_improvement(current, candidate, config):
 
 
 class _Evaluator:
-    def __init__(self, model, target, batch, mode):
+    def __init__(self, model, target, batch, mode, *, profile=False, timings=None):
+        self.profile, self.timings = profile, timings or StageTimings()
+        self.mode = mode
         self.model, self.batch = model, batch
         target = jnp.asarray(target)
         if target.ndim == 2:
@@ -189,39 +210,85 @@ class _Evaluator:
             inputs = model.input_embeddings(current_batch)
             return jax.grad(lambda x: model.reconstruction_loss(x, current_batch, target, mode=mode))(inputs)
 
+        # Profiling splits the forward from the reduction without an extra forward.
+        self._encoder = jax.jit(lambda ids: model.encode_token_ids(layout(ids), mode="encoder"))
+        self._project = jax.jit(model.project) if profile and mode == "projected" else None
+        self._reduce = jax.jit(lambda prediction: jnp.mean(jnp.square(prediction - target), axis=(1, 2)))
         self._losses = jax.jit(losses)
         self._gradient = jax.jit(gradient)
 
     def losses(self, ids):
-        values = np.asarray(self._losses(jnp.asarray(ids)))
+        ids = jnp.asarray(ids)
+        if self.profile:
+            with self.timings.measure("encoder_forward", sequences=len(ids)):
+                prediction = self._encoder(ids).block_until_ready()
+            if self._project is not None:
+                with self.timings.measure("projection", sequences=len(ids)):
+                    prediction = self._project(prediction).block_until_ready()
+            with self.timings.measure("loss_reduction", sequences=len(ids)):
+                values = np.asarray(self._reduce(prediction))
+        else:
+            with self.timings.measure("forward_and_loss", sequences=len(ids)):
+                values = np.asarray(self._losses(ids))
         if not np.isfinite(values).all():
             raise FloatingPointError("Non-finite candidate loss")
         return values
 
     def gradient(self, tokens):
-        values = self._gradient(jnp.asarray(tokens[None, :]))[0, :self.batch.prompt_length]
+        with self.timings.measure("input_gradient", sequences=1):
+            values = self._gradient(jnp.asarray(tokens[None, :])).block_until_ready()[0, :self.batch.prompt_length]
         if not np.isfinite(np.asarray(values)).all():
             raise FloatingPointError("Non-finite input gradient")
         return values
 
 
-def _best_candidate(evaluator, center, replacements, config, counters, *, diagnostic=False):
+def _best_candidate(evaluator, center, replacements, config, counters, *, diagnostic=False,
+                    progress=None, total=None):
     best, best_loss = None, float("inf")
-    for ids, candidates in candidate_token_batches(center, replacements, config.candidate_batch_size):
-        losses = evaluator.losses(ids)
-        counters.candidate_batches += 1
-        if diagnostic:
-            counters.diagnostic_candidate_evaluations += len(candidates)
-        else:
-            counters.search_candidate_evaluations += len(candidates)
-        for candidate, loss in zip(candidates, losses):
-            loss = float(loss)
-            if best is None or (loss, candidate.position, candidate.token) < (best_loss, best.position, best.token):
-                best, best_loss = candidate, loss
+    timings = evaluator.timings
+    start, last_report, done = perf_counter(), 0.0, 0
+    # Group profiled batches by position so each position's time is measured directly.
+    groups = groupby(replacements, key=lambda c: c.position) if config.profile else ((None, replacements),)
+    for position, candidates_at_position in groups:
+        timings.position = position
+        if config.profile and progress is not None:
+            progress("position_start", f"Computing candidate losses at token position {position}",
+                     iteration=timings.iteration, position=position, console=False)
+        position_start, position_done = perf_counter(), done
+        for ids, candidates in candidate_token_batches(center, candidates_at_position, config.candidate_batch_size):
+            losses = evaluator.losses(ids)
+            counters.candidate_batches += 1
+            if diagnostic:
+                counters.diagnostic_candidate_evaluations += len(candidates)
+            else:
+                counters.search_candidate_evaluations += len(candidates)
+            with timings.measure("candidate_selection"):
+                for candidate, loss in zip(candidates, losses):
+                    loss = float(loss)
+                    if best is None or (loss, candidate.position, candidate.token) < (best_loss, best.position, best.token):
+                        best, best_loss = candidate, loss
+            done += len(candidates)
+            now = perf_counter()
+            if progress is not None and (now - last_report >= config.progress_interval_seconds or done == total):
+                elapsed = now - start
+                eta = elapsed / done * (total - done) if total is not None else None
+                progress("candidate_progress", f"Iteration {timings.iteration}: candidate losses {done}/{total} "
+                         f"({100 * done / total:.1f}%), position {candidates[-1].position}, ETA {duration(eta)}",
+                         iteration=timings.iteration, position=int(candidates[-1].position), candidates_done=done,
+                         candidates_total=total, candidate_seconds=elapsed, eta_seconds=eta,
+                         best_loss=best_loss, diagnostic=diagnostic,
+                         stage_seconds=timings.totals(timings.phase, timings.iteration))
+                last_report = now
+        if config.profile and progress is not None:
+            progress("position_done", f"Finished candidate losses at token position {position}",
+                     iteration=timings.iteration, position=position, console=False,
+                     seconds=perf_counter() - position_start, candidates_done=done - position_done,
+                     stage_timings=timings.records(phase=timings.phase, iteration=timings.iteration, position=position))
+    timings.position = None
     return best, best_loss
 
 
-def _diagnose(evaluator, center, center_loss, positions, allowed, config, counters):
+def _diagnose(evaluator, center, center_loss, positions, allowed, config, counters, progress=None):
     start = perf_counter()
     center = center.copy()
     size = sum(int(np.count_nonzero(allowed != center[p])) for p in positions)
@@ -238,13 +305,13 @@ def _diagnose(evaluator, center, center_loss, positions, allowed, config, counte
                     yield Replacement(int(position), int(token))
                     emitted += 1
 
-    best, loss = _best_candidate(evaluator, center, replacements(), config, counters, diagnostic=True)
+    best, loss = _best_candidate(evaluator, center, replacements(), config, counters, diagnostic=True, progress=progress, total=count)
     return NeighborhoodDiagnostic(center, center_loss, best, loss if best else None,
                                   best is not None and _strict_improvement(center_loss, loss, config),
                                   count == size, size, count, perf_counter() - start)
 
 
-def attack(target_codes, initial_tokens, model, config: AttackConfig = AttackConfig()) -> AttackResult:
+def attack(target_codes, initial_tokens, model, config: AttackConfig = AttackConfig(), *, progress=None) -> AttackResult:
     """Run greedy search without any oracle information.
 
     Candidate budget counts sequences (including optional diagnostics), not batches;
@@ -257,20 +324,31 @@ def attack(target_codes, initial_tokens, model, config: AttackConfig = AttackCon
     max_iterations, candidate_budget, no_improvement. Optional diagnostics run at
     the final frozen center using the remaining budget and never modify the result.
     """
+    def report(event, message, **fields):
+        if progress is not None:
+            progress(event, message, **fields)
+
     start = perf_counter()
+    timings = StageTimings()
+    report("attack_start", f"Attack setup: {config.mode}, up to {config.max_iterations} iterations",
+           max_iterations=config.max_iterations, candidate_budget=config.max_candidate_evaluations)
     batch = single_prompt(model, initial_tokens)
     current = np.array(batch.input_ids[0, :batch.prompt_length], dtype=np.int32)
     positions = np.flatnonzero(np.asarray(batch.editable_mask[0, :batch.prompt_length]))
     allowed = allowed_vocabulary(model, config.allowed_token_ids)
-    evaluator = _Evaluator(model, target_codes, batch, config.mode)
+    evaluator = _Evaluator(model, target_codes, batch, config.mode, profile=config.profile, timings=timings)
     warmup_seconds = 0.0
     if config.warmup:
         warmup_start = perf_counter()
+        timings.phase = "warmup"
+        report("warmup_start", "JIT warmup: compiling loss batches, input gradient, and embedding scores")
         # Execute all loss batch shapes and the gradient/scoring path before timing.
         # These calls neither consume the search budget nor make search decisions.
-        sizes = {sum(min(config.k, int(np.count_nonzero(allowed != current[p]))) for p in positions)}
+        counts = [min(config.k, int(np.count_nonzero(allowed != current[p]))) for p in positions]
+        sizes = set(counts) if config.profile else {sum(counts)}
         if config.exhaustive_diagnostic:
-            sizes.add(sum(int(np.count_nonzero(allowed != current[p])) for p in positions))
+            counts = [int(np.count_nonzero(allowed != current[p])) for p in positions]
+            sizes.update(counts if config.profile else [sum(counts)])
             sizes.add(config.max_candidate_evaluations)
         batch_sizes = {1}
         for size in sizes:
@@ -279,14 +357,22 @@ def attack(target_codes, initial_tokens, model, config: AttackConfig = AttackCon
                 if size % config.candidate_batch_size:
                     batch_sizes.add(size % config.candidate_batch_size)
         for size in sorted(batch_sizes):
+            report("warmup_forward_start", f"Warmup encoder/loss forward: batch size {size}", batch_size=size)
             evaluator.losses(np.repeat(current[None, :], size, axis=0))
+        report("warmup_gradient_start", "Warmup input gradient: forward and backward")
         gradients = evaluator.gradient(current)
-        shortlist_replacements(current, positions, model.embedding_table, gradients, allowed, config.k)
+        report("warmup_scores_start", "Warmup vocabulary embedding scores")
+        shortlist_replacements(current, positions, model.embedding_table, gradients, allowed, config.k, timings=timings)
         warmup_seconds = perf_counter() - warmup_start
+        report("warmup_done", f"Warmup finished in {duration(warmup_seconds)}", seconds=warmup_seconds)
         start = perf_counter()
+    timings.phase = "search"
+    report("initial_loss_start", "Computing initial encoder forward and reconstruction loss")
     counters = ComputationCounters(initial_loss_evaluations=1)
     loss = float(evaluator.losses(current[None, :])[0])
+    report("initial_loss_done", f"Initial loss: {loss:.8g}", loss=loss)
     history, substitutions, shortlists = [loss], [], []
+    iteration_seconds = []
     while True:
         if loss <= config.stopping_loss_tolerance:
             reason = "loss_tolerance"
@@ -304,14 +390,43 @@ def attack(target_codes, initial_tokens, model, config: AttackConfig = AttackCon
         if shortlist_size > config.max_candidate_evaluations - counters.candidate_evaluations:
             reason = "candidate_budget"
             break
+        iteration_start = perf_counter()
+        timings.iteration = counters.iterations + 1
+        report("gradient_start", f"Iteration {timings.iteration}/{config.max_iterations}: input gradient (forward + backward)",
+               iteration=timings.iteration, max_iterations=config.max_iterations, loss=loss)
+        gradient_start = perf_counter()
         gradients = evaluator.gradient(current)
+        report("gradient_done", f"Iteration {timings.iteration}: input gradient took {duration(perf_counter() - gradient_start)}",
+               iteration=timings.iteration, seconds=perf_counter() - gradient_start)
+        report("shortlist_start", f"Iteration {timings.iteration}: scoring vocabulary embeddings at {len(positions)} positions")
         counters.gradient_evaluations += 1
         counters.iterations += 1
-        candidates = shortlist_replacements(current, positions, model.embedding_table, gradients, allowed, config.k)
+        shortlist_start = perf_counter()
+        candidates = shortlist_replacements(current, positions, model.embedding_table, gradients, allowed, config.k, timings=timings)
+        report("shortlist_done", f"Iteration {timings.iteration}: embedding scoring and shortlist took {duration(perf_counter() - shortlist_start)}",
+               iteration=timings.iteration, seconds=perf_counter() - shortlist_start)
         if config.record_shortlists:
             shortlists.append(tuple(candidates))
-        best, best_loss = _best_candidate(evaluator, current, candidates, config, counters)
-        if not _strict_improvement(loss, best_loss, config):
+        report("candidate_losses_start", f"Iteration {timings.iteration}: evaluating {len(candidates)} candidate losses "
+               f"with encoder batches of {config.candidate_batch_size}", iteration=timings.iteration,
+               candidates_total=len(candidates), batch_size=config.candidate_batch_size)
+        best, best_loss = _best_candidate(evaluator, current, candidates, config, counters,
+                                         progress=progress, total=len(candidates))
+        elapsed = perf_counter() - iteration_start
+        iteration_seconds.append(elapsed)
+        improving = _strict_improvement(loss, best_loss, config)
+        remaining = min(config.max_iterations - counters.iterations,
+                        (config.max_candidate_evaluations - counters.candidate_evaluations) // shortlist_size)
+        if not improving or best_loss <= config.stopping_loss_tolerance:
+            remaining = 0
+        eta = sum(iteration_seconds) / len(iteration_seconds) * remaining
+        report("iteration_done", f"Iteration {timings.iteration}/{config.max_iterations}: loss {loss:.8g} → {best_loss:.8g}, "
+               f"{'accepted' if improving else 'no improvement'}, {duration(elapsed)}, "
+               f"estimated remaining budget time {duration(eta)} (may stop early)",
+               iteration=timings.iteration, seconds=elapsed, loss_before=loss, best_loss=best_loss,
+               accepted=improving, remaining_iterations_in_budget=remaining, budget_eta_seconds=eta,
+               candidate_evaluations=counters.candidate_evaluations)
+        if not improving:
             reason = "no_improvement"
             break
         substitutions.append(Substitution(counters.iterations, best.position, int(current[best.position]),
@@ -319,10 +434,14 @@ def attack(target_codes, initial_tokens, model, config: AttackConfig = AttackCon
         current[best.position] = best.token
         loss = best_loss
         history.append(loss)
-    diagnostic = (_diagnose(evaluator, current, loss, positions, allowed, config, counters)
+    timings.phase = "diagnostic"
+    diagnostic = (_diagnose(evaluator, current, loss, positions, allowed, config, counters, progress=progress)
                   if config.exhaustive_diagnostic else None)
+    runtime = perf_counter() - start
+    report("attack_done", f"Attack finished: {reason}, final loss {loss:.8g}, {duration(runtime)}",
+           stop_reason=reason, loss=loss, seconds=runtime)
     return AttackResult(current.copy(), tuple(history), tuple(substitutions), reason,
-                        perf_counter() - start, counters, diagnostic, warmup_seconds, tuple(shortlists))
+                        runtime, counters, diagnostic, warmup_seconds, tuple(shortlists), timings.records())
 
 
 def exhaustive_single_token_neighborhood(target_codes, center_tokens, model,
@@ -337,7 +456,7 @@ def exhaustive_single_token_neighborhood(target_codes, center_tokens, model,
     center = np.array(batch.input_ids[0, :batch.prompt_length], dtype=np.int32)
     positions = np.flatnonzero(np.asarray(batch.editable_mask[0, :batch.prompt_length]))
     allowed = allowed_vocabulary(model, config.allowed_token_ids)
-    evaluator = _Evaluator(model, target_codes, batch, config.mode)
+    evaluator = _Evaluator(model, target_codes, batch, config.mode, profile=config.profile)
     counters = ComputationCounters(initial_loss_evaluations=1)
     loss = float(evaluator.losses(center[None, :])[0])
     return _diagnose(evaluator, center, loss, positions, allowed, config, counters), counters

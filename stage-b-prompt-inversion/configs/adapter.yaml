@@ -19,9 +19,5 @@ denoiser:
 prompt_length: 8
 # Synthetic non-conditioning suffix: exactly one valid EOS, then EOS padding.
 filler_token_ids: [1]
-target_modes: [encoder, projected]
 local_files_only: true
-seed: 42
-rtol: 0.00003
-atol: 0.00003
 # Eight-token verification fixture; evaluation selects its own prompt layout.
