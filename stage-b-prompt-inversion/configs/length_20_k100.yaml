@@ -4,7 +4,7 @@ seed: 42
 modes: [projected]
 num_prompts: 50
 corruption_counts: [all]
-corruption_trials: 1
+corruption_trials: 5
 selection:
   policy: full_prompt_preserve_all_specials
   exact_token_count: 20
