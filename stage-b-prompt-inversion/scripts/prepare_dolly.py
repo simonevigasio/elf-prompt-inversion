@@ -9,7 +9,9 @@ import random
 import sys
 import urllib.request
 
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+# if TOKENIZERS_PARALLELISM exists don't do anything, otherwise create the variable with false as default value
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false") 
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from transformers import AutoTokenizer
@@ -21,20 +23,31 @@ FILENAME = "databricks-dolly-15k.jsonl"
 
 
 def main():
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tokens", type=int, default=20)
     parser.add_argument("--count", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", type=Path, default=Path("data/dolly-20-tokens-50.jsonl"))
     parser.add_argument("--cache-dir", type=Path, default=Path("data/source"))
-    args = parser.parse_args()
+    args = parser.parse_args() # process the command parameters
+
     if not 1 <= args.tokens <= 64 or args.count <= 0 or args.seed < 0:
-        parser.error("tokens must be 1–64, count positive, and seed nonnegative")
+        parser.error("tokens must be 1-64, count positive, and seed nonnegative")
+
     spec = read_settings()["tokenizer"]
-    tokenizer = AutoTokenizer.from_pretrained(spec["repo"], revision=spec["revision"], local_files_only=True)
+
+    # Download tokenizer from the local cache folder, if not it will download it from internt and then save it locally.
+    tokenizer = AutoTokenizer.from_pretrained(spec["repo"], revision=spec["revision"])
+
     source_url = f"https://huggingface.co/datasets/{REPO}/resolve/{REVISION}/{FILENAME}"
+
     args.cache_dir.mkdir(parents=True, exist_ok=True)
+
     source_path = args.cache_dir / f"{REVISION}-{FILENAME}"
+
+
+    
     if not source_path.exists():
         print(f"Downloading {REPO} at {REVISION}", flush=True)
         with urllib.request.urlopen(source_url, timeout=60) as response:
@@ -43,6 +56,8 @@ def main():
         for line in payload.splitlines():
             json.loads(line)
         source_path.write_bytes(payload)
+
+
     source_bytes = source_path.read_bytes()
     eligible, seen = [], set()
     special = set(tokenizer.all_special_ids)
@@ -61,6 +76,8 @@ def main():
         eligible.append({"id": f"dolly-{row_index:05d}", "text": text})
     if len(eligible) < args.count:
         raise ValueError(f"Need {args.count} eligible prompts, found {len(eligible)}")
+
+    
     selected = sorted(random.Random(args.seed).sample(eligible, args.count), key=lambda row: row["id"])
     args.output.parent.mkdir(parents=True, exist_ok=True)
     payload = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in selected).encode("utf-8")
