@@ -38,7 +38,7 @@ from prompt_inversion.attack import AttackConfig, attack
 from prompt_inversion.data import allowed_vocabulary, single_prompt
 from prompt_inversion.profiling import duration
 
-from . import progress, results
+from . import progress, results, start_jax_backend
 from .progress import ProgressLogger
 from .results import (append_result, canonical, locked_directory, read_results,
                       summarize, write_manifest, write_timings)
@@ -302,6 +302,7 @@ def run_evaluation(config_path, dataset_path, output_dir, *, modes=None, model=N
         raise FileNotFoundError(f"Local JSONL dataset not found: {dataset_path}")
 
     jax.config.update("jax_default_matmul_precision", config["matmul_precision"])
+    device = start_jax_backend()
     jax.config.update("jax_enable_x64", False)
 
     adapter_path = (config_path.parent / config["model"]).resolve()
@@ -309,6 +310,7 @@ def run_evaluation(config_path, dataset_path, output_dir, *, modes=None, model=N
         adapter_settings = yaml.safe_load(handle)
     output.mkdir(parents=True, exist_ok=True)
     with locked_directory(output), ProgressLogger(output / "progress.jsonl", config["logging"]["progress_interval_seconds"]) as log:
+        log.report("device", f"JAX device: {device}", device=device)
         log.report("model_loading_start", f"Loading local model artifacts for {config['modes']}")
         loading_start = perf_counter()
         if model is None:

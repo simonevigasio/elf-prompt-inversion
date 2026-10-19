@@ -186,9 +186,11 @@ def main(argv=None):
         parser.error(f"Use a new output directory: {output}")
 
     jax.config.update("jax_default_matmul_precision", "highest")
+    device = experiments.start_jax_backend()
     output.mkdir(parents=True)
     print(f"Results and progress log: {output}", flush=True)
     with ProgressLogger(output / "progress.jsonl", args.progress_interval) as log:
+        log.report("device", f"JAX device: {device}", device=device)
         run(config, args.observation, output, log.report, args.progress_interval)
 
 

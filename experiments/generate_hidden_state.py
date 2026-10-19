@@ -28,6 +28,7 @@ import numpy as np
 
 from backbone_inversion.forward import BackboneForward, ForwardMetadata
 from elf_model.adapter import DEFAULT_SETTINGS, ELFAdapter
+from experiments import start_jax_backend
 
 HIDDEN_STATE, METADATA, TRUTH = "hidden_state.npy", "observation.json", "truth.npz"
 
@@ -176,6 +177,7 @@ def main(argv=None):
         parser.error(f"Use a new output directory: {args.output}")
 
     jax.config.update("jax_default_matmul_precision", "highest")
+    print(f"JAX device: {start_jax_backend()}", flush=True)
     print("Loading pinned ELF weights offline", flush=True)
     adapter = ELFAdapter.from_config(args.model, projected=True, local_files_only=True)
     tokens = prompt_tokens(adapter, args.prompt, args.token_ids)
