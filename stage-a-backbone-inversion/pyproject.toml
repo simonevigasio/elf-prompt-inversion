@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=69.5.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "elf-backbone-inversion"
+version = "0.1.0"
+description = "Continuous inversion of frozen ELF backbone observations"
+requires-python = ">=3.10,<3.13"
+dependencies = ["elf-prompt-inversion==0.1.0"]
+
+[project.scripts]
+elf-invert-backbone = "backbone_inversion.experiment:main"
+
+[tool.setuptools.packages.find]
+include = ["backbone_inversion*"]
