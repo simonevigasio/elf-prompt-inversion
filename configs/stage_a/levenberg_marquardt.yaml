@@ -13,7 +13,7 @@ stagnation_rtol: 1.0e-8
 stagnation_iterations: 3
 initial_damping: 1.0e-2
 min_damping: 1.0e-8
-max_damping: 1.0e12
+max_damping: 1.0e+12
 damping_increase: 10.0
 damping_decrease: 0.3
 restarts: 3

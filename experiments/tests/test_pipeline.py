@@ -110,6 +110,17 @@ class PipelineCommandTests(unittest.TestCase):
                 with self.assertRaises(SystemExit):  # outputs are never overwritten
                     main(["--config", str(config), "--output", str(root / "external")])
 
+    def test_repository_configs_load(self):
+        # PyYAML reads e.g. 1.0e12 (no exponent sign) as a string; catch such typos here.
+        from experiments.corruption import read_config
+        configs = Path(__file__).resolve().parents[2] / "configs"
+        for path in sorted((configs / "pipeline").glob("*.yaml")):
+            with self.subTest(config=path.name):
+                load_config(path)
+        for path in sorted((configs / "corruption").glob("*.yaml")):
+            with self.subTest(config=path.name):
+                read_config(path)
+
     def test_config_validation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
