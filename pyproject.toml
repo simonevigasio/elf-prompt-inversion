@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=69.5.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "elf-prompt-inversion"
+version = "0.2.0"
+description = "Recover ELF prompts from hidden states: backbone inversion (Stage A) and token search (Stage B)"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+  "jax==0.4.38", "jaxlib==0.4.38", "flax==0.10.2",
+  "orbax-checkpoint==0.5.23", "optax==0.2.5",
+  "numpy>=1.26.4,<2", "PyYAML>=6.0.1", "einops>=0.7.0",
+  "transformers==4.44.2", "huggingface-hub>=0.23,<1",
+  "sentencepiece>=0.2,<0.3",
+]
+
+[project.optional-dependencies]
+# ELF's native data collator, used by the adapter equivalence tests.
+test = ["torch==2.3.0", "datasets>=2.19"]
+
+[tool.setuptools]
+packages = ["elf_model", "backbone_inversion", "prompt_inversion", "experiments"]
+
+[tool.setuptools.package-dir]
+backbone_inversion = "stage-a-backbone-inversion/backbone_inversion"
+prompt_inversion = "stage-b-prompt-inversion/prompt_inversion"

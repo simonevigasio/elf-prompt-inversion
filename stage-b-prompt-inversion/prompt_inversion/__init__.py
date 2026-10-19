@@ -1,1 +1,1 @@
-"""Stage B prompt-inversion adapter for the pinned official ELF implementation."""
+"""Stage B: greedy token search matching a target ELF prompt representation."""

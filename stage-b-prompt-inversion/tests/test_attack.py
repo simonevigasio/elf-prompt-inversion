@@ -1,100 +1,18 @@
 """Small, deterministic search tests: no checkpoints, downloads, or pilot run."""
 import os
 import unittest
-from types import SimpleNamespace
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import jax.numpy as jnp
 import numpy as np
 
+from elf_model.testing import TinyModel
 from prompt_inversion.attack import (AttackConfig, Replacement, attack, candidate_token_batches,
                             exhaustive_single_token_neighborhood, shortlist_replacements)
-from prompt_inversion.data import corrupt_tokens
-from prompt_inversion.elf_adapter import PromptBatch
-
-
-class TinyTokenizer:
-    all_special_ids = (0, 1)
-
-    def __len__(self):
-        return 6
-
-
-class TinyModel:
-    """Nonlinear differentiable model: linearized ranking can overshoot the target.
-
-    Uses the adapter interface and full sequence layout. Projected mode deliberately
-    changes both scale and offset, so mixing target modes fails the search tests.
-    """
-    def __init__(self, length=2, embeddings=None):
-        self.prompt_length = length
-        self.tokenizer = TinyTokenizer()
-        self.encoder = SimpleNamespace(config=SimpleNamespace(d_model=1))
-        self.config = SimpleNamespace(bottleneck_dim=1)
-        self.embedding_table = jnp.asarray(embeddings if embeddings is not None else np.arange(6),
-                                           dtype=jnp.float32).reshape(6, 1)
-
-    def prepare_token_ids(self, tokens):
-        ids = np.asarray(tokens)
-        if ids.ndim == 1:
-            ids = ids[None, :]
-        if ids.ndim != 2 or ids.shape[1] != self.prompt_length or not np.issubdtype(ids.dtype, np.integer):
-            raise ValueError("Invalid prompt shape or dtype")
-        if np.any(ids < 0) or np.any(ids >= 6):
-            raise ValueError("Invalid token ID")
-        full = np.ones((len(ids), self.prompt_length + 3), dtype=np.int32)
-        full[:, :self.prompt_length] = ids
-        positions = np.arange(full.shape[1])[None, :]
-        cond = np.broadcast_to(positions < self.prompt_length, full.shape)
-        valid = np.broadcast_to(positions < self.prompt_length + 1, full.shape)
-        mask = (cond[:, :, None] & cond[:, None, :]) | (~cond[:, :, None] & valid[:, None, :])
-        editable = cond & ~np.isin(full, self.tokenizer.all_special_ids)
-        return PromptBatch(*(jnp.asarray(x) for x in (full, mask, valid, cond, editable)), self.prompt_length)
-
-    def input_embeddings(self, batch):
-        return self.embedding_table[batch.input_ids]
-
-    def encode_embeddings(self, embeddings, batch, mode="encoder"):
-        x = jnp.where(batch.editable_mask[..., None], embeddings, self.input_embeddings(batch))
-        output = x[:, :batch.prompt_length] ** 2
-        if mode == "projected":
-            output = 2 * output + 0.25
-        return output
-
-    def encode_token_ids(self, batch, mode="encoder"):
-        return self.encode_embeddings(self.input_embeddings(batch), batch, mode)
-
-    def reconstruction_loss(self, embeddings, batch, target, mode="encoder"):
-        return jnp.mean((self.encode_embeddings(embeddings, batch, mode) - target) ** 2)
-
-    def project(self, codes):
-        return 2 * codes + 0.25
-
-    def target(self, tokens, mode="encoder"):
-        return self.encode_token_ids(self.prepare_token_ids(tokens), mode)
 
 
 class AttackTests(unittest.TestCase):
-    def test_corruption_exact_distinct_count_seed_and_protection(self):
-        model = TinyModel(length=5)
-        original = np.array([1, 2, 3, 4, 5])
-        a = corrupt_tokens(original, model, k=3, seed=42)
-        b = corrupt_tokens(original, model, k=3, seed=42)
-        np.testing.assert_array_equal(a.tokens, b.tokens)
-        self.assertEqual(a.positions, b.positions)
-        self.assertEqual(np.count_nonzero(a.tokens != original), 3)
-        self.assertEqual(len(set(a.positions)), 3)
-        self.assertEqual(a.tokens[0], 1)
-        self.assertTrue(all(a.tokens[p] != original[p] for p in a.positions))
-        self.assertFalse(np.isin(a.replacement_tokens, model.tokenizer.all_special_ids).any())
-        np.testing.assert_array_equal(original, [1, 2, 3, 4, 5])
-        np.testing.assert_array_equal(corrupt_tokens(original, model, k=0, seed=42).tokens, original)
-        with self.assertRaises(ValueError):
-            corrupt_tokens(original, model, k=5, seed=42)
-        with self.assertRaises(ValueError):
-            corrupt_tokens([2], TinyModel(1), k=1, seed=42, allowed_token_ids=[0, 1, 2])
-
     def test_shortlist_every_position_current_exclusion_and_score_ties(self):
         model = TinyModel(3)
         tokens = np.array([2, 3, 4])

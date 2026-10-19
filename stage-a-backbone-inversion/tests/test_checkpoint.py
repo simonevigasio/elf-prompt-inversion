@@ -5,15 +5,15 @@ import unittest
 import jax
 import numpy as np
 
-from prompt_inversion.elf_adapter import ELFAdapter
 from backbone_inversion.forward import BackboneForward, ForwardMetadata
 from backbone_inversion.recovery import recover
 from backbone_inversion.solver import SolverConfig
-from backbone_inversion.synthetic import observe
+from elf_model.adapter import ELFAdapter
+from experiments.generate_hidden_state import observe
 
 
-@unittest.skipUnless(os.environ.get("STAGE_A_CHECKPOINTS") == "1",
-                     "Set STAGE_A_CHECKPOINTS=1 with pinned artifacts cached")
+@unittest.skipUnless(os.environ.get("ELF_CHECKPOINTS") == "1",
+                     "Set ELF_CHECKPOINTS=1 with pinned artifacts cached")
 class CheckpointTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

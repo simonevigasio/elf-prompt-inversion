@@ -7,14 +7,14 @@ import jax.numpy as jnp
 import numpy as np
 
 from backbone_inversion.forward import BackboneForward, ForwardMetadata
-from backbone_inversion.synthetic import observe
-from fixtures import tiny_adapter
+from elf_model.testing import tiny_native_adapter
+from experiments.generate_hidden_state import observe
 
 
 class ForwardTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.adapter = tiny_adapter()
+        cls.adapter = tiny_native_adapter()
 
     def test_native_forward_equivalence_all_layers_and_masks(self):
         for layer in (0, 1, 2):

@@ -97,12 +97,14 @@ def relative_residual(absolute, observation_norm):
     return absolute / observation_norm if observation_norm > 0 else absolute
 
 
-def levenberg_marquardt(forward, observation, initial, config=SolverConfig()):
+def levenberg_marquardt(forward, observation, initial, config=SolverConfig(), *, progress=None):
     """Minimize 0.5 ||F(x)-observation||². Damping is not a prior penalty.
 
     The only differentiable argument is x. Parameters belong to the frozen
     forward closure. No dense Jacobian or normal matrix is ever materialized.
     Runtime includes tracing/compilation and synchronized device operations.
+    ``progress(event, message, **fields)``, if given, is called after every
+    iteration; it never affects the solve.
     """
     start = perf_counter()
     y, x = jnp.asarray(observation, dtype=jnp.float32), jnp.asarray(initial, dtype=jnp.float32)
@@ -156,6 +158,18 @@ def levenberg_marquardt(forward, observation, initial, config=SolverConfig()):
                 "damping": damping, "step_norm": step_norm, "gradient_norm": float(gradient_norm),
                 "cg_iterations": int(cg_iters), "cg_residual": float(cg_residual),
                 "cg_breakdown": bool(bad)})
+            if progress is not None:
+                elapsed = perf_counter() - start
+                # Upper bound: the solve usually stops before max_iterations.
+                eta = elapsed / iteration * (config.max_iterations - iteration)
+                residual = candidate_residual if accepted else absolute
+                progress("lm_iteration", f"LM iteration {iteration}/{config.max_iterations}: "
+                         f"residual {residual:.6g} (target {tolerance:.3g}), "
+                         f"{'accepted' if accepted else 'rejected'}, damping {damping:.3g}, "
+                         f"{int(cg_iters)} CG steps, at most {eta:.0f}s left",
+                         iteration=iteration, residual=residual, tolerance=tolerance,
+                         accepted=bool(accepted), damping=damping, cg_iterations=int(cg_iters),
+                         seconds=elapsed, max_eta_seconds=eta)
             small_step = step_norm <= config.step_atol + config.step_rtol * float(jnp.linalg.norm(x))
             if accepted:
                 improvement = objective - candidate_objective

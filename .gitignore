@@ -1,0 +1,26 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+.cache/
+
+# Generated data and results.
+data/
+outputs/
+
+# Model artifacts and arrays never belong in Git.
+checkpoints/
+checkpoint_*/
+*.pkl
+*.pt
+*.pth
+*.safetensors
+*.msgpack
+*.ocdbt
+*.arrow
+*.parquet
+*.npy
+*.npz

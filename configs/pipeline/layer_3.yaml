@@ -1,0 +1,17 @@
+# Full pipeline: hidden state after the third complete backbone block -> Stage A -> Stage B.
+# Paths are relative to this file.
+model: ../model.yaml
+stage_a: ../stage_a/levenberg_marquardt.yaml
+stage_b: ../stage_b/k16.yaml
+
+# Synthetic observation, generated when run_pipeline.py gets no --observation.
+# The prompt is only used to create the hidden state and to score the result.
+synthetic_observation:
+  prompt: The small bird flew over the quiet
+  observation_layer: 3
+  noise_seed: 100
+
+# Stage B starts from random non-special tokens drawn with this seed.
+# Add "tokens: [...]" to start from explicit token IDs instead.
+stage_b_initialization:
+  seed: 200

@@ -1,4 +1,7 @@
-"""Stage A orchestration and structured results; accepts no oracle example."""
+"""Stage A recovery: random restarts, structured result, Stage B target.
+
+Accepts only the observation, the frozen model and declared metadata.
+"""
 from dataclasses import dataclass
 from time import perf_counter
 
@@ -29,13 +32,18 @@ class RecoveryResult:
     diagnostics: dict
 
 
-def recover(observation, adapter, metadata: ForwardMetadata, config=SolverConfig()):
+def recover(observation, adapter, metadata: ForwardMetadata, config=SolverConfig(), *, progress=None):
     """Recover from H, weights, and public metadata only; independent random starts.
 
     There is deliberately no ground-truth-initialization argument. Diagnostic
     oracle initialization, if desired, must call the lower-level numerical solver
     separately and be labeled as such; it is never selected by this routine.
+    ``progress(event, message, **fields)`` optionally reports restarts and LM iterations.
     """
+    def report(event, message, **fields):
+        if progress is not None:
+            progress(event, message, **fields)
+
     start = perf_counter()
     forward = BackboneForward(adapter, metadata)
     y = jnp.asarray(observation, dtype=jnp.float32)
@@ -54,9 +62,16 @@ def recover(observation, adapter, metadata: ForwardMetadata, config=SolverConfig
     else:
         for restart in range(config.restarts):
             seed = config.seed + restart
+            report("restart_start", f"Stage A restart {restart + 1}/{config.restarts} (seed {seed}); "
+                   "the first iteration includes JIT compilation", restart=restart, seed=seed)
             initial = forward.initialize(seed, config.prompt_init_std)
-            result = levenberg_marquardt(forward, y, initial, config)
+            result = levenberg_marquardt(forward, y, initial, config, progress=progress)
             candidates.append(result)
+            report("restart_done", f"Stage A restart {restart + 1}/{config.restarts}: "
+                   f"residual {result.absolute_residual:.6g}, {result.stop_reason}, "
+                   f"{result.iterations} iterations, {result.runtime_seconds:.0f}s",
+                   restart=restart, residual=result.absolute_residual, converged=result.converged,
+                   stop_reason=result.stop_reason, seconds=result.runtime_seconds)
     for i, result in enumerate(candidates):
         summaries.append({"restart": i, "seed": None if algebraic is not None else config.seed + i,
             "absolute_residual": result.absolute_residual, "relative_residual": result.relative_residual,
@@ -76,18 +91,3 @@ def recover(observation, adapter, metadata: ForwardMetadata, config=SolverConfig
         summaries[best]["seed"], best, method,
         {**forward.rank_diagnostics, "restarts": summaries,
          "latent_parameterization": "affine_bottleneck_row_space", "regularization": "none"})
-
-
-def run_pipeline(observation, initial_tokens, adapter, metadata, solver_config=SolverConfig(),
-                 attack_config=None):
-    """Share one adapter; always pass the recovered target, including on nonconvergence."""
-    from prompt_inversion.attack import AttackConfig, attack
-
-    attack_config = attack_config or AttackConfig(mode="projected")
-    if attack_config.mode != "projected":
-        raise ValueError("Stage A supplies projected targets only; encoder inversion is nonunique")
-    recovered = recover(observation, adapter, metadata, solver_config)
-    if not np.isfinite(recovered.absolute_residual):
-        return recovered, None
-    discrete = attack(recovered.stage_b_target, initial_tokens, adapter, attack_config)
-    return recovered, discrete
