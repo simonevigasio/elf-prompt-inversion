@@ -152,7 +152,7 @@ estimate; `recover` has no ground-truth argument.
 ## Tests
 
 ```bash
-.venv/bin/python -m unittest discover -s stage-a-backbone-inversion/tests -v
+.venv/bin/python -m unittest discover -s backbone-inversion/tests -v
 ```
 
 Small CPU tests run ELF's native modules with random weights and cover all

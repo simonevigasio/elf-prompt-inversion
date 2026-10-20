@@ -3,9 +3,9 @@
 Recover the prompt given to ELF (embedded language flows) from one of its
 hidden states, in two stages:
 
-1. **Stage A**, [backbone inversion](stage-a-backbone-inversion/README.md): from a
+1. **Stage A**, [backbone inversion](backbone-inversion/README.md): from a
    hidden state, estimate the continuous bottleneck codes that produced it.
-2. **Stage B**, [prompt inversion](stage-b-prompt-inversion/README.md): search
+2. **Stage B**, [prompt inversion](prompt-inversion/README.md): search
    for prompt tokens whose code matches Stage A's estimate.
 
 ```text
@@ -17,8 +17,8 @@ configs/
   pipeline/                  full experiments: model + stage_a + stage_b + synthetic prompt/layer
   corruption/                Stage B oracle-corruption experiments
 elf_model/                   ELFAdapter: native ELF forward maps used by both stages
-stage-a-backbone-inversion/  Stage A only (backbone_inversion package)
-stage-b-prompt-inversion/    Stage B only (prompt_inversion package)
+backbone-inversion/          Stage A only (backbone_inversion package)
+prompt-inversion/            Stage B only (prompt_inversion package)
 experiments/                 datasets, hidden-state generation, experiment runners
 data/                        generated datasets and hidden states (git-ignored)
 outputs/                     experiment results (git-ignored)
@@ -90,7 +90,7 @@ All other commands run from the repository root with `.venv/bin/python`
 No checkpoints or downloads needed; the ELF checkout is.
 
 ```bash
-for suite in elf_model stage-a-backbone-inversion stage-b-prompt-inversion experiments; do
+for suite in elf_model backbone-inversion prompt-inversion experiments; do
   .venv/bin/python -m unittest discover -s $suite/tests || break
 done
 ```

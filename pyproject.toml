@@ -23,5 +23,5 @@ test = ["torch==2.3.0", "datasets>=2.19"]
 packages = ["elf_model", "backbone_inversion", "prompt_inversion", "experiments"]
 
 [tool.setuptools.package-dir]
-backbone_inversion = "stage-a-backbone-inversion/backbone_inversion"
-prompt_inversion = "stage-b-prompt-inversion/prompt_inversion"
+backbone_inversion = "backbone-inversion/backbone_inversion"
+prompt_inversion = "prompt-inversion/prompt_inversion"

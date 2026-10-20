@@ -75,7 +75,7 @@ diagnostic; its result never changes the search.
 ## Tests
 
 ```bash
-.venv/bin/python -m unittest discover -s stage-b-prompt-inversion/tests -v
+.venv/bin/python -m unittest discover -s prompt-inversion/tests -v
 ```
 
 These cover shortlisting, frozen-center batches, exact best-candidate selection,
