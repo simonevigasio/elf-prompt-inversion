@@ -9,11 +9,15 @@ synthetic_observation prompt and saved in <output>/observation/. Stage A only
 receives the hidden state and its declared metadata. The true prompt and codes
 (truth.npz) are read after recovery, only to score the result.
 
+Stage A runs once; Stage B runs ``trials`` times (set in the stage_b file,
+default 1) from random starts with seeds ``seed + trial``. The reported
+``stage_b`` is the trial with the lowest final loss, chosen without the truth.
+
 Each run writes a new directory (default outputs/pipeline/<config>-<UTC time>/):
 
     observation/    the generated hidden state (synthetic runs only)
     recovery.npz    observation, recovered coordinates and codes, Stage B target
-    report.json     Stage A diagnostics, Stage B result, evaluation against truth
+    report.json     Stage A diagnostics, Stage B trials, evaluation against truth
     manifest.json   configuration, model provenance, hashes, versions
     progress.jsonl  live progress events (the same lines are printed to the console)
 
@@ -56,6 +60,7 @@ class PipelineConfig:
     model: Path
     solver: SolverConfig
     search: AttackConfig
+    trials: int  # Stage B runs per Stage A result
     synthetic_observation: dict | None
     initialization: dict
     resolved: dict  # every setting, with the stage files inlined, for the manifest
@@ -70,7 +75,11 @@ def load_config(path):
         raise ValueError(f"{path}: needs {sorted(required)}, optionally synthetic_observation")
     stage_a = yaml.safe_load((path.parent / raw["stage_a"]).read_text())
     stage_b = yaml.safe_load((path.parent / raw["stage_b"]).read_text())
-    search = AttackConfig(**stage_b)
+    # trials belongs to the experiment, not to a single attack.
+    search = AttackConfig(**{k: v for k, v in stage_b.items() if k != "trials"})
+    trials = stage_b.get("trials", 1)
+    if isinstance(trials, bool) or not isinstance(trials, int) or trials < 1:
+        raise ValueError("stage_b trials must be an integer >= 1")
     if search.mode != "projected":
         raise ValueError("Stage A recovers projected codes; Stage B must use mode: projected")
     synthetic = raw.get("synthetic_observation")
@@ -83,30 +92,37 @@ def load_config(path):
     if not isinstance(initialization, dict) or len(initialization.keys() & {"seed", "tokens"}) != 1 \
             or initialization.keys() - {"seed", "tokens"}:
         raise ValueError("stage_b_initialization needs exactly one of seed or tokens")
-    return PipelineConfig(path, (path.parent / raw["model"]).resolve(), SolverConfig(**stage_a), search,
+    if "tokens" in initialization and trials != 1:
+        raise ValueError("Explicit stage_b_initialization.tokens give identical trials; use seed")
+    return PipelineConfig(path, (path.parent / raw["model"]).resolve(), SolverConfig(**stage_a), search, trials,
                           synthetic, initialization,
                           {**raw, "stage_a": stage_a, "stage_b": stage_b, "stage_a_file": raw["stage_a"],
                            "stage_b_file": raw["stage_b"]})
 
 
-def initial_tokens(adapter, initialization, prompt_length, allowed_token_ids=None):
-    """Stage B's starting prompt: explicit IDs, or random non-special tokens (never the truth)."""
+def initial_tokens(adapter, initialization, prompt_length, allowed_token_ids=None, trial=0):
+    """Stage B's starting prompt: explicit IDs, or random non-special tokens (never the truth).
+
+    Random starts use seed ``seed + trial``, so trial 0 matches a single-trial run.
+    """
     if "tokens" in initialization:
         tokens = np.asarray(initialization["tokens"])
     else:
         allowed = allowed_vocabulary(adapter, allowed_token_ids)
-        tokens = np.random.default_rng(initialization["seed"]).choice(allowed, size=prompt_length)
+        tokens = np.random.default_rng(initialization["seed"] + trial).choice(allowed, size=prompt_length)
     adapter.prepare_token_ids(tokens)  # validates length and vocabulary
     return tokens
 
 
-def run_stages(observation, initial, adapter, metadata, solver_config=SolverConfig(), attack_config=None,
+def run_stages(observation, initials, adapter, metadata, solver_config=SolverConfig(), attack_config=None,
                *, progress=None):
-    """Stage A then Stage B on one shared adapter.
+    """Stage A once, then one Stage B trial per starting prompt in ``initials``.
 
+    Returns the Stage A result and the list of Stage B results, in trial order.
     Stage B always receives Stage A's estimate, even when Stage A did not
-    converge; it is skipped only if the recovered fit is entirely nonfinite.
-    ``progress(event, message, **fields)`` receives both stages' status events.
+    converge; it is skipped (empty list) only if the recovered fit is entirely
+    nonfinite. ``progress(event, message, **fields)`` receives both stages'
+    status events; Stage B events carry their ``trial`` index.
     """
     attack_config = attack_config or AttackConfig(mode="projected")
     if attack_config.mode != "projected":
@@ -120,10 +136,21 @@ def run_stages(observation, initial, adapter, metadata, solver_config=SolverConf
            residual=recovered.absolute_residual, seconds=recovered.runtime_seconds)
     if not np.isfinite(recovered.absolute_residual):
         report("stage_b_skipped", "Stage B skipped: Stage A's fit is not finite")
-        return recovered, None
-    report("stage_b_start", f"Stage B: token search with K={attack_config.k}, "
-           f"up to {attack_config.max_iterations} iterations")
-    return recovered, attack(recovered.stage_b_target, initial, adapter, attack_config, progress=progress)
+        return recovered, []
+    results = []
+    for trial, initial in enumerate(initials):
+        def trial_progress(event, message, **fields):
+            report(event, f"Trial {trial + 1}/{len(initials)}: {message}", trial=trial, **fields)
+        trial_progress("stage_b_start", f"Stage B: token search with K={attack_config.k}, "
+                       f"up to {attack_config.max_iterations} iterations")
+        results.append(attack(recovered.stage_b_target, initial, adapter, attack_config,
+                              progress=trial_progress if progress else None))
+    return recovered, results
+
+
+def best_trial(discrete):
+    """Index of the lowest final loss (ties: first trial); uses no ground truth."""
+    return min(range(len(discrete)), key=lambda i: (discrete[i].final_loss, i)) if discrete else None
 
 
 def evaluate(recovered, discrete, truth, tokenizer, generator):
@@ -220,23 +247,35 @@ def run(config, observation_dir, output, report, progress_interval=10.0):
         report("observation_done", "Hidden state generated and saved in observation/")
     metadata = observation.metadata
 
-    initial = initial_tokens(adapter, config.initialization, metadata.prompt_length, config.search.allowed_token_ids)
+    initials = [initial_tokens(adapter, config.initialization, metadata.prompt_length,
+                               config.search.allowed_token_ids, trial)
+                for trial in range(config.trials)]
     search = replace(config.search, progress_interval_seconds=progress_interval)
-    recovered, discrete = run_stages(observation.hidden_state, initial, adapter, metadata, config.solver,
+    recovered, discrete = run_stages(observation.hidden_state, initials, adapter, metadata, config.solver,
                                      search, progress=report)
+    best = best_trial(discrete)
 
     result = {"observation": source, "metadata": asdict(metadata),
               **{k: v for k, v in asdict(recovered).items()
                  if k not in {"coordinates", "prompt_code", "noise_code", "stage_b_target"}}}
-    result["stage_b"] = None if discrete is None else {
-        "tokens": discrete.tokens, "text": adapter.tokenizer.decode(discrete.tokens),
-        "initial_tokens": initial, "final_loss": discrete.final_loss,
-        "stop_reason": discrete.stop_reason, "accepted_moves": len(discrete.accepted_substitutions),
-        "candidate_evaluations": discrete.counters.candidate_evaluations,
-        "runtime_seconds": discrete.runtime_seconds}
+    result["stage_b_trials"] = [{
+        "trial": trial, "seed": config.initialization["seed"] + trial if "seed" in config.initialization else None,
+        "tokens": attempt.tokens, "text": adapter.tokenizer.decode(attempt.tokens),
+        "initial_tokens": initial, "final_loss": attempt.final_loss,
+        "stop_reason": attempt.stop_reason, "accepted_moves": len(attempt.accepted_substitutions),
+        "candidate_evaluations": attempt.counters.candidate_evaluations,
+        "runtime_seconds": attempt.runtime_seconds} for trial, (initial, attempt) in enumerate(zip(initials, discrete))]
+    result["stage_b"] = None if best is None else result["stage_b_trials"][best]
     if observation.truth is not None:
-        result["synthetic_evaluation"] = evaluate(recovered, discrete, observation.truth,
-                                                  adapter.tokenizer, observation.generator)
+        scores = evaluate(recovered, None if best is None else discrete[best], observation.truth,
+                          adapter.tokenizer, observation.generator)
+        truth_tokens = np.asarray(observation.truth["tokens"])
+        per_trial = [{"trial": i, "token_accuracy": float(np.mean(attempt.tokens == truth_tokens)),
+                      "exact_tokens": bool(np.array_equal(attempt.tokens, truth_tokens))}
+                     for i, attempt in enumerate(discrete)]
+        result["synthetic_evaluation"] = {**scores, "stage_b_trials": per_trial,
+            "stage_b_exact_recovery_rate": float(np.mean([t["exact_tokens"] for t in per_trial])) if per_trial else 0.0,
+            "stage_b_mean_token_accuracy": float(np.mean([t["token_accuracy"] for t in per_trial])) if per_trial else 0.0}
     manifest = {
         "config_path": config.path, "configuration": config.resolved,
         "model_provenance": adapter.provenance,
@@ -254,11 +293,14 @@ def run(config, observation_dir, output, report, progress_interval=10.0):
 
     print(f"Stage A: converged={recovered.converged} ({recovered.stop_reason}), "
           f"residual={recovered.absolute_residual:.6g}, relative={recovered.relative_residual:.6g}", flush=True)
-    if discrete is not None:
-        print(f"Stage B: {result['stage_b']['text']!r}, loss={discrete.final_loss:.6g} ({discrete.stop_reason})", flush=True)
+    for trial in result["stage_b_trials"]:
+        marker = " (best)" if trial["trial"] == best else ""
+        print(f"Stage B trial {trial['trial']}: {trial['text']!r}, loss={trial['final_loss']:.6g} "
+              f"({trial['stop_reason']}){marker}", flush=True)
     if observation.truth is not None:
         scores = result["synthetic_evaluation"]
-        print(f"Truth:   {scores['true_text']!r}, token accuracy={scores['stage_b_token_accuracy']:.3g}, "
+        print(f"Truth:   {scores['true_text']!r}, best-trial token accuracy={scores['stage_b_token_accuracy']:.3g}, "
+              f"exact recovery rate={scores['stage_b_exact_recovery_rate']:.3g} over {len(discrete)} trial(s), "
               f"prompt code error={scores['prompt_code_error']:.3g}", flush=True)
     print(f"Saved {output}", flush=True)
 

@@ -61,6 +61,8 @@ same folder; follow it from another terminal with `tail -f <folder>/progress.jso
 - Different prompt or layer: copy a file in `configs/pipeline/` and edit
   `synthetic_observation`.
 - Larger Stage B search: `configs/pipeline/layer_3_k100.yaml` (uses `configs/stage_b/k100.yaml`).
+- Several Stage B random starts on the same Stage A result: set
+  `trials` in the `configs/stage_b/` file.
 - Existing hidden state: `--observation data/observations/<name>` (see below).
 
 `run_pipeline.py` works from any directory and uses `.venv` automatically.

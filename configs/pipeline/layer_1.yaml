@@ -11,7 +11,8 @@ synthetic_observation:
   observation_layer: 1
   noise_seed: 100
 
-# Stage B starts from random non-special tokens drawn with this seed.
-# Add "tokens: [...]" to start from explicit token IDs instead.
+# Stage B trial t starts from random non-special tokens drawn with seed + t (the number
+# of trials is in the stage_b file). Add "tokens: [...]" instead of seed to start from
+# explicit token IDs (one trial only).
 stage_b_initialization:
   seed: 200

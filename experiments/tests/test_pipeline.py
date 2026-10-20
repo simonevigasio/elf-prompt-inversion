@@ -10,6 +10,7 @@ import numpy as np
 import yaml
 
 from backbone_inversion.forward import ForwardMetadata
+from backbone_inversion.recovery import recover
 from backbone_inversion.solver import SolverConfig
 from elf_model.testing import tiny_native_adapter
 from experiments.generate_hidden_state import load_observation, observe
@@ -25,7 +26,7 @@ class StageIntegrationTests(unittest.TestCase):
     def test_deeper_numerical_recovery(self):
         metadata = ForwardMetadata(1, 1)
         truth = observe(self.adapter, [4], metadata)
-        result, discrete = run_stages(truth.observation, [5], self.adapter, metadata,
+        result, (discrete,) = run_stages(truth.observation, [[5]], self.adapter, metadata,
             SolverConfig(restarts=1, max_iterations=60, residual_atol=1e-4, residual_rtol=1e-5),
             AttackConfig(k=9, max_iterations=3, stopping_loss_tolerance=1e-8))
         self.assertTrue(result.converged, (result.stop_reason, result.absolute_residual))
@@ -46,7 +47,7 @@ class StageIntegrationTests(unittest.TestCase):
     def test_layer_zero_target_is_the_prompt_code(self):
         metadata = ForwardMetadata(1, 0)
         truth = observe(self.adapter, [4], metadata)
-        result, discrete = run_stages(truth.observation, [5], self.adapter, metadata,
+        result, (discrete,) = run_stages(truth.observation, [[5]], self.adapter, metadata,
             SolverConfig(restarts=1), AttackConfig(k=9, max_iterations=3, stopping_loss_tolerance=1e-8))
         self.assertTrue(result.converged)
         np.testing.assert_array_equal(discrete.tokens, [4])
@@ -57,7 +58,7 @@ class StageIntegrationTests(unittest.TestCase):
         metadata = ForwardMetadata(1, 1)
         truth = observe(self.adapter, [4], metadata)
         with patch("experiments.pipeline.attack", wraps=attack) as spy:
-            result, discrete = run_stages(truth.observation, [5], self.adapter, metadata,
+            result, (discrete,) = run_stages(truth.observation, [[5]], self.adapter, metadata,
                 SolverConfig(restarts=1, max_iterations=0), AttackConfig(max_iterations=0))
         self.assertFalse(result.converged)
         self.assertEqual(result.stop_reason, "max_iterations")
@@ -69,7 +70,7 @@ class StageIntegrationTests(unittest.TestCase):
         metadata = ForwardMetadata(1, 0)
         truth = observe(self.adapter, [4], metadata)
         with self.assertRaises(ValueError):
-            run_stages(truth.observation, [5], self.adapter, metadata, attack_config=AttackConfig(mode="encoder"))
+            run_stages(truth.observation, [[5]], self.adapter, metadata, attack_config=AttackConfig(mode="encoder"))
 
 
 class PipelineCommandTests(unittest.TestCase):
@@ -110,6 +111,28 @@ class PipelineCommandTests(unittest.TestCase):
                 with self.assertRaises(SystemExit):  # outputs are never overwritten
                     main(["--config", str(config), "--output", str(root / "external")])
 
+    def test_stage_b_trials_share_stage_a(self):
+        adapter = tiny_native_adapter()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.write_config(root, stage_b_initialization={"seed": 3})
+            (root / "stage_b.yaml").write_text(yaml.safe_dump({"mode": "projected", "k": 9, "max_iterations": 2,
+                                                               "trials": 3}))
+            with patch("elf_model.adapter.ELFAdapter.from_config", return_value=adapter), \
+                    patch("experiments.pipeline.recover", wraps=recover) as stage_a:
+                main(["--config", str(config), "--output", str(root / "trials")])
+            self.assertEqual(stage_a.call_count, 1)
+            report = json.loads((root / "trials/report.json").read_text())
+            trials = report["stage_b_trials"]
+            self.assertEqual([t["trial"] for t in trials], [0, 1, 2])
+            self.assertEqual([t["seed"] for t in trials], [3, 4, 5])
+            best = min(trials, key=lambda t: (t["final_loss"], t["trial"]))
+            self.assertEqual(report["stage_b"], best)
+            evaluation = report["synthetic_evaluation"]
+            self.assertEqual(len(evaluation["stage_b_trials"]), 3)
+            self.assertEqual(evaluation["stage_b_exact_recovery_rate"],
+                             np.mean([t["exact_tokens"] for t in evaluation["stage_b_trials"]]))
+
     def test_repository_configs_load(self):
         # PyYAML reads e.g. 1.0e12 (no exponent sign) as a string; catch such typos here.
         from experiments.corruption import read_config
@@ -127,10 +150,19 @@ class PipelineCommandTests(unittest.TestCase):
             for overrides in ({"stage_b_initialization": {"seed": 1, "tokens": [5]}},
                               {"synthetic_observation": {"prompt": "x", "token_ids": [4], "observation_layer": 0}},
                               {"synthetic_observation": {"token_ids": [4]}},
+                              {"stage_b_initialization": {"seed": 1, "trials": 2}},
                               {"unknown": 1}):
                 with self.subTest(overrides=overrides), self.assertRaises(ValueError):
                     load_config(self.write_config(root, **overrides))
             config = self.write_config(root)
+            for trials in (0, True):
+                with self.subTest(trials=trials), self.assertRaisesRegex(ValueError, "trials"):
+                    (root / "stage_b.yaml").write_text(yaml.safe_dump({"mode": "projected", "trials": trials}))
+                    load_config(config)
+            # Explicit start tokens with several trials (stage_b file) would repeat one search.
+            (root / "stage_b.yaml").write_text(yaml.safe_dump({"mode": "projected", "trials": 2}))
+            with self.assertRaisesRegex(ValueError, "tokens"):
+                load_config(config)
             (root / "stage_b.yaml").write_text(yaml.safe_dump({"mode": "encoder"}))
             with self.assertRaisesRegex(ValueError, "projected"):
                 load_config(config)

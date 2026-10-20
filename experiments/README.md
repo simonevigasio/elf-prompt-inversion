@@ -60,17 +60,25 @@ stage_b_initialization:
   seed: 200                           # random non-special tokens; or tokens: [...]
 ```
 
+Stage A runs once per run. Stage B then runs `trials` times on Stage A's target
+(`trials: 5` in the `configs/stage_b/` file, default 1), trial `t` starting from
+random tokens drawn with seed `seed + t` (trial 0 matches a single-trial run).
+Explicit `tokens` allow only one trial.
+
 Without `--observation`, the hidden state is generated and saved in
 `<output>/observation/`. Stage A sees only the hidden state and its metadata;
 Stage B starts from random tokens, never from the truth. `truth.npz` is read
 afterwards, only to score the result. Each run writes a new directory (default
 `outputs/pipeline/<config>-<UTC time>/`, or `--output`):
 
-- `report.json`: Stage A residuals and diagnostics, the `stage_b` result
-  (tokens, text, loss, stop reason) and, when truth exists, `synthetic_evaluation`:
+- `report.json`: Stage A residuals and diagnostics, `stage_b_trials` (tokens, text,
+  loss, stop reason, seed of every trial), `stage_b` (the trial with the lowest final
+  loss, chosen without the truth) and, when truth exists, `synthetic_evaluation`:
   - `prompt_code_error` / `noise_code_error`: distance of Stage A's codes from the truth;
-  - `stage_b_token_accuracy`: fraction of positions whose token ID matches the truth;
-  - `stage_b_exact_tokens`: every position matches.
+  - `stage_b_token_accuracy` / `stage_b_exact_tokens`: the best trial's fraction of
+    matching token IDs, and whether every position matches;
+  - `stage_b_trials`, `stage_b_mean_token_accuracy`, `stage_b_exact_recovery_rate`:
+    the same scores per trial and averaged over trials.
 - `recovery.npz`: observation, recovered coordinates and codes, Stage B target.
 - `manifest.json`: resolved configuration, model provenance, hashes, versions.
 - `progress.jsonl`: live status events, also printed to the console. Stage A

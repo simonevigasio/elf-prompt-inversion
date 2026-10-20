@@ -5,3 +5,6 @@ candidate_batch_size: 32
 max_iterations: 20
 max_candidate_evaluations: 10000
 stopping_loss_tolerance: 1.0e-8
+# Pipeline only: Stage B runs from this many random starts on one Stage A result
+# (seeds stage_b_initialization.seed + trial); report.json keeps all, "stage_b" is the lowest loss.
+trials: 1

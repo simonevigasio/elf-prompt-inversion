@@ -8,3 +8,6 @@ max_iterations: 50
 # 8 positions * 100 candidates * 50 iterations.
 max_candidate_evaluations: 40000
 stopping_loss_tolerance: 1.0e-8
+# Pipeline only: Stage B runs from this many random starts on one Stage A result
+# (seeds stage_b_initialization.seed + trial); report.json keeps all, "stage_b" is the lowest loss.
+trials: 1
