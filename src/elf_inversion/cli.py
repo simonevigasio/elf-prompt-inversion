@@ -1,0 +1,397 @@
+"""Pipeline command: ELF hidden state -> Stage A (bottleneck codes) -> Stage B (tokens).
+
+    python run_pipeline.py --config configs/pipeline/layer_3.yaml
+    python run_pipeline.py --config configs/pipeline/layer_3.yaml --prompt "A different prompt"
+    python run_pipeline.py --config configs/pipeline/layer_3.yaml \\
+        --observation outputs/pipeline/<earlier run>/observation
+    python run_pipeline.py --config configs/pipeline/layer_3.yaml \\
+        --dataset data/dolly/dolly-20-tokens-50.jsonl --output outputs/pipeline/dolly-20
+
+``python -m elf_inversion.cli`` is the same command. It runs on CPU unless
+JAX_PLATFORMS is already set.
+
+Without --observation, the hidden state is generated from a prompt: the
+config's synthetic_observation prompt, --prompt, or each --dataset row. The
+config's synthetic_observation settings (layer, noise seed, ...) apply to all of
+them. Stage A only receives the hidden state and its declared metadata. The true
+prompt and codes (truth.npz) are read after recovery, only to score the result.
+
+Stage A runs once per hidden state; Stage B runs ``trials`` times (set in the
+stage_b file, default 1) from random starts with seeds ``seed + trial``. The
+reported ``stage_b`` is the trial with the lowest final loss, chosen without
+the truth. The inversion itself lives in elf_inversion.pipeline.
+
+A single run writes a new directory (default outputs/pipeline/<config>-<UTC time>/):
+
+    observation/    the generated hidden state (synthetic runs only)
+    recovery.npz    observation, recovered coordinates and codes, Stage B target
+    report.json     Stage A diagnostics, Stage B trials, evaluation against truth
+    manifest.json   configuration, model provenance, hashes, versions
+    progress.jsonl  live progress events (the same lines are printed to the console)
+
+A --dataset run (JSONL rows with string "id" and "text") writes into --output
+and resumes there when rerun with the same command:
+
+    results.jsonl   one row per prompt: recovered text, scores, Stage A diagnostics
+    summary.json    exact-recovery rate, mean token accuracy, Stage A convergence rate
+    manifest.json   configuration, dataset and source hashes (the resume identity)
+    progress.jsonl  live progress events
+
+Follow a running experiment from another terminal with
+``tail -f <output>/progress.jsonl``.
+"""
+from .runtime import start_jax_backend  # first: sets the CPU default before JAX is imported
+
+import argparse
+from dataclasses import asdict, dataclass, replace
+from datetime import datetime, timezone
+import hashlib
+from importlib.metadata import version
+import json
+from pathlib import Path
+from time import perf_counter
+
+import jax
+import numpy as np
+import yaml
+
+import elf_inversion
+
+from .backbone.solver import SolverConfig
+from .model.adapter import ELFAdapter
+from .observation import generate, load_observation, prompt_tokens, save_observation
+from .pipeline import InversionResult, invert_observation, invert_prompt
+from .progress import ProgressLogger
+from .runs import (append_result, digest, file_sha256, json_safe, locked_directory,
+                   read_results, write_manifest)
+from .tokens.attack import AttackConfig
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SYNTHETIC_KEYS = {"prompt", "token_ids", "observation_layer", "noise_seed",
+                  "self_cond_cfg_scale", "attention_mask"}
+
+
+@dataclass(frozen=True)
+class PipelineConfig:
+    path: Path
+    model: Path
+    solver: SolverConfig
+    search: AttackConfig
+    trials: int  # Stage B runs per Stage A result
+    synthetic_observation: dict | None
+    initialization: dict
+    resolved: dict  # every setting, with the stage files inlined, for the manifest
+
+
+def load_config(path):
+    """Read a pipeline config; stage and model paths are relative to it."""
+    path = Path(path).resolve()
+    raw = yaml.safe_load(path.read_text())
+    required = {"model", "stage_a", "stage_b", "stage_b_initialization"}
+    if not required <= raw.keys() or raw.keys() - required - {"synthetic_observation"}:
+        raise ValueError(f"{path}: needs {sorted(required)}, optionally synthetic_observation")
+    # Stage files list only what differs from the SolverConfig/AttackConfig defaults.
+    stage_a = yaml.safe_load((path.parent / raw["stage_a"]).read_text()) or {}
+    stage_b = yaml.safe_load((path.parent / raw["stage_b"]).read_text()) or {}
+    solver = SolverConfig(**stage_a)
+    # trials belongs to the experiment, not to a single attack.
+    search = AttackConfig(**{k: v for k, v in stage_b.items() if k != "trials"})
+    trials = stage_b.get("trials", 1)
+    if isinstance(trials, bool) or not isinstance(trials, int) or trials < 1:
+        raise ValueError("stage_b trials must be an integer >= 1")
+    if search.mode != "projected":
+        raise ValueError("Stage A recovers projected codes; Stage B must use mode: projected")
+    synthetic = raw.get("synthetic_observation")
+    if synthetic is not None:
+        if synthetic.keys() - SYNTHETIC_KEYS or "observation_layer" not in synthetic or \
+                ("prompt" in synthetic) == ("token_ids" in synthetic):
+            raise ValueError("synthetic_observation needs observation_layer and exactly one of "
+                             f"prompt or token_ids; allowed keys: {sorted(SYNTHETIC_KEYS)}")
+    initialization = raw["stage_b_initialization"]
+    if not isinstance(initialization, dict) or len(initialization.keys() & {"seed", "tokens"}) != 1 \
+            or initialization.keys() - {"seed", "tokens"}:
+        raise ValueError("stage_b_initialization needs exactly one of seed or tokens")
+    if "tokens" in initialization and trials != 1:
+        raise ValueError("Explicit stage_b_initialization.tokens give identical trials; use seed")
+    # The manifest records every effective value, defaults included, not just the file contents.
+    return PipelineConfig(path, (path.parent / raw["model"]).resolve(), solver, search, trials,
+                          synthetic, initialization,
+                          {**raw, "stage_a": asdict(solver), "stage_b": {**asdict(search), "trials": trials},
+                           "stage_a_file": raw["stage_a"], "stage_b_file": raw["stage_b"]})
+
+
+def generation_options(synthetic):
+    """Keyword arguments of generate()/invert_prompt() from a synthetic_observation section."""
+    return {"observation_layer": synthetic["observation_layer"],
+            "noise_seed": synthetic.get("noise_seed", 100),
+            "self_cond_cfg_scale": synthetic.get("self_cond_cfg_scale", 1.0),
+            "attention_mask": synthetic.get("attention_mask")}
+
+
+def inversion_options(config, progress_interval):
+    """Keyword arguments of invert_observation()/invert_prompt() from a pipeline config."""
+    start = config.initialization
+    return {"solver": config.solver, "search": replace(config.search, progress_interval_seconds=progress_interval),
+            "trials": config.trials, "seed": start.get("seed", 0), "start_tokens": start.get("tokens")}
+
+
+def trial_records(result: InversionResult):
+    return [{"trial": trial, "seed": result.seeds[trial], "tokens": attempt.tokens, "text": result.texts[trial],
+             "initial_tokens": result.initial_tokens[trial], "final_loss": attempt.final_loss,
+             "stop_reason": attempt.stop_reason, "accepted_moves": len(attempt.accepted_substitutions),
+             "candidate_evaluations": attempt.counters.candidate_evaluations,
+             "runtime_seconds": attempt.runtime_seconds}
+            for trial, attempt in enumerate(result.stage_b)]
+
+
+def source_hashes():
+    files = sorted(Path(elf_inversion.__file__).parent.rglob("*.py"))
+    return {str(path.relative_to(REPO_ROOT)): hashlib.sha256(path.read_bytes()).hexdigest() for path in files}
+
+
+def package_versions():
+    return {p: version(p) for p in ("jax", "jaxlib", "flax", "numpy", "elf-prompt-inversion")}
+
+
+def default_output(config_path):
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return REPO_ROOT / "outputs" / "pipeline" / f"{Path(config_path).stem}-{stamp}"
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Run Stage A followed by Stage B on ELF hidden states.")
+    parser.add_argument("--config", type=Path, required=True, help="Pipeline config, e.g. configs/pipeline/layer_3.yaml")
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--observation", type=Path,
+                        help="Existing observation directory; default: generate one from the config's prompt")
+    source.add_argument("--prompt", help="Generate the hidden state from this text instead of the config's prompt")
+    source.add_argument("--dataset", type=Path,
+                        help="JSONL file of prompts (string id and text); needs --output, resumes there")
+    parser.add_argument("--output", type=Path, help="Results directory; default: outputs/pipeline/<config>-<time>")
+    parser.add_argument("--progress-interval", type=float, default=10.0,
+                        help="Seconds between progress lines and heartbeats during long steps (default 10)")
+    args = parser.parse_args(argv)
+    if not args.progress_interval > 0:
+        parser.error("--progress-interval must be positive")
+    config = load_config(args.config)
+    if args.observation is None and config.synthetic_observation is None:
+        parser.error("The config has no synthetic_observation (observation layer and noise); pass --observation")
+    if args.dataset is not None:
+        if args.output is None:
+            parser.error("--dataset needs --output, so that rerunning the command resumes there")
+        if "tokens" in config.initialization:
+            parser.error("--dataset prompts differ in length; use stage_b_initialization.seed")
+        if not args.dataset.is_file():
+            parser.error(f"Dataset not found: {args.dataset}")
+    output = (args.output or default_output(config.path)).absolute()
+    if args.dataset is None and output.exists():
+        parser.error(f"Use a new output directory: {output}")
+
+    jax.config.update("jax_default_matmul_precision", "highest")
+    device = start_jax_backend()
+    output.mkdir(parents=True, exist_ok=args.dataset is not None)
+    print(f"Results and progress log: {output}", flush=True)
+    if args.dataset is not None:
+        with locked_directory(output), ProgressLogger(output / "progress.jsonl", args.progress_interval) as log:
+            log.report("device", f"JAX device: {device}", device=device)
+            run_dataset(config, args.dataset, output, log.report, args.progress_interval)
+        return
+    with ProgressLogger(output / "progress.jsonl", args.progress_interval) as log:
+        log.report("device", f"JAX device: {device}", device=device)
+        run(config, args.observation, output, log.report, args.progress_interval, prompt=args.prompt)
+
+
+def load_adapter(config, report):
+    report("model_loading_start", "Loading pinned ELF weights offline")
+    adapter = ELFAdapter.from_config(config.model, projected=True, local_files_only=True)
+    report("model_loading_done", "Model loaded")
+    return adapter
+
+
+def run(config, observation_dir, output, report, progress_interval=10.0, *, prompt=None):
+    """One pipeline run into the existing ``output`` directory; ``report`` logs progress.
+
+    ``prompt`` replaces the config's synthetic_observation prompt.
+    """
+    adapter = load_adapter(config, report)
+    if observation_dir is not None:
+        observation = load_observation(observation_dir)
+        source = str(Path(observation_dir).absolute())
+        report("observation_loaded", f"Loaded observation {source}")
+    else:
+        synthetic = config.synthetic_observation
+        if prompt is not None:
+            tokens = prompt_tokens(adapter, prompt=prompt)
+        else:
+            tokens = prompt_tokens(adapter, synthetic.get("prompt"), synthetic.get("token_ids"))
+        options = generation_options(synthetic)
+        report("observation_start", f"Generating the hidden state after {options['observation_layer']} "
+               f"block(s) for {len(tokens)} prompt tokens")
+        observation, adapter = generate(adapter, tokens, **options)
+        save_observation(output / "observation", observation)
+        source = "observation/"
+        report("observation_done", "Hidden state generated and saved in observation/")
+    result = invert_observation(observation, adapter, **inversion_options(config, progress_interval), progress=report)
+    recovered, metadata = result.stage_a, observation.metadata
+
+    report_json = {"observation": source, "metadata": asdict(metadata),
+                   **{k: v for k, v in asdict(recovered).items()
+                      if k not in {"coordinates", "prompt_code", "noise_code", "stage_b_target"}}}
+    report_json["stage_b_trials"] = trial_records(result)
+    report_json["stage_b"] = None if result.best is None else report_json["stage_b_trials"][result.best]
+    if result.evaluation is not None:
+        report_json["synthetic_evaluation"] = result.evaluation
+    manifest = {
+        "config_path": config.path, "configuration": config.resolved,
+        **({"prompt_override": prompt} if prompt is not None else {}),
+        "model_provenance": adapter.provenance,
+        "model_settings_sha256": hashlib.sha256(config.model.read_bytes()).hexdigest(),
+        "observation_sha256": hashlib.sha256(np.asarray(observation.hidden_state).tobytes()).hexdigest(),
+        "source_sha256": source_hashes(),
+        "packages": package_versions(),
+        "devices": [str(d) for d in jax.devices()], "precision": "float32/highest",
+        "claim": "Forward reconstruction does not establish unique latent or token recovery"}
+    np.savez(output / "recovery.npz", observation=np.asarray(observation.hidden_state),
+             coordinates=np.asarray(recovered.coordinates), prompt_code=np.asarray(recovered.prompt_code),
+             noise_code=np.asarray(recovered.noise_code), stage_b_target=np.asarray(recovered.stage_b_target))
+    for filename, value in (("report.json", report_json), ("manifest.json", manifest)):
+        (output / filename).write_text(json.dumps(json_safe(value), indent=2, allow_nan=False) + "\n")
+
+    print(f"Stage A: converged={recovered.converged} ({recovered.stop_reason}), "
+          f"residual={recovered.absolute_residual:.6g}, relative={recovered.relative_residual:.6g}", flush=True)
+    for trial in report_json["stage_b_trials"]:
+        marker = " (best)" if trial["trial"] == result.best else ""
+        print(f"Stage B trial {trial['trial']}: {trial['text']!r}, loss={trial['final_loss']:.6g} "
+              f"({trial['stop_reason']}){marker}", flush=True)
+    if result.evaluation is not None:
+        scores = result.evaluation
+        print(f"Truth:   {scores['true_text']!r}, best-trial token accuracy={scores['stage_b_token_accuracy']:.3g}, "
+              f"exact recovery rate={scores['stage_b_exact_recovery_rate']:.3g} over {len(result.stage_b)} trial(s), "
+              f"prompt code error={scores['prompt_code_error']:.3g}", flush=True)
+    print(f"Saved {output}", flush=True)
+
+
+def read_dataset(path):
+    """Rows {"id": nonempty string, "text": string}, in file order; blank lines are ignored."""
+    rows, seen = [], set()
+    with open(path, encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if not isinstance(row, dict) or not isinstance(row.get("id"), str) or not row["id"] \
+                    or not isinstance(row.get("text"), str):
+                raise ValueError(f"{path}, line {line_number}: require nonempty string id and string text")
+            if row["id"] in seen:
+                raise ValueError(f"{path}: duplicate prompt id {row['id']!r}")
+            seen.add(row["id"])
+            rows.append({"id": row["id"], "text": row["text"]})
+    if not rows:
+        raise ValueError(f"{path} contains no prompts")
+    return rows
+
+
+def dataset_row(example, result: InversionResult, seconds):
+    recovered, evaluation = result.stage_a, result.evaluation
+    best = None if result.best is None else result.stage_b[result.best]
+    trials = trial_records(result)
+    for trial, scores in zip(trials, evaluation["stage_b_trials"]):
+        trial.update(scores)
+        del trial["initial_tokens"]
+    return {"example_id": example["id"], "status": "done", "text": example["text"],
+            "prompt_token_count": int(result.observation.metadata.prompt_length),
+            "true_tokens": evaluation["true_tokens"], "recovered_tokens": result.tokens,
+            "recovered_text": result.text, "exact_recovery": evaluation["stage_b_exact_tokens"],
+            "token_accuracy": evaluation["stage_b_token_accuracy"],
+            "final_loss": None if best is None else best.final_loss,
+            "stage_b_stop_reason": None if best is None else best.stop_reason,
+            "prompt_code_error": evaluation["prompt_code_error"], "noise_code_error": evaluation["noise_code_error"],
+            "stage_a": {key: getattr(recovered, key) for key in (
+                "method", "converged", "stop_reason", "absolute_residual", "relative_residual",
+                "iterations", "runtime_seconds")},
+            "stage_b_trials": trials, "runtime_seconds": seconds}
+
+
+def summarize_dataset(rows, total):
+    done = [r for r in rows if r["status"] == "done"]
+    skipped = {}
+    for row in rows:
+        if row["status"] == "skipped":
+            skipped[row["reason"]] = skipped.get(row["reason"], 0) + 1
+
+    def mean(values):
+        return float(np.mean(values)) if values else None
+
+    return {"prompts": total, "completed": len(done), "skipped": sum(skipped.values()), "skipped_reasons": skipped,
+            "pending": total - len(rows),
+            "exact_recovery_rate": mean([r["exact_recovery"] for r in done]),
+            "mean_token_accuracy": mean([r["token_accuracy"] for r in done]),
+            "stage_a_convergence_rate": mean([r["stage_a"]["converged"] for r in done]),
+            "mean_runtime_seconds": mean([r["runtime_seconds"] for r in done])}
+
+
+def run_dataset(config, dataset_path, output, report, progress_interval=10.0):
+    """Invert every dataset prompt into the locked ``output``; completed prompts are skipped on rerun.
+
+    Prompts that cannot be inverted (empty, special tokens, longer than ELF's
+    conditioning prefix) are recorded as skipped with their reason.
+    """
+    examples = read_dataset(dataset_path)
+    identity = {"kind": "pipeline_dataset", "configuration": json_safe(config.resolved),
+                "dataset_sha256": file_sha256(dataset_path),
+                "model_settings_sha256": file_sha256(config.model),
+                "source_sha256": source_hashes(), "packages": package_versions(),
+                "precision": "float32/highest"}
+    run_id = digest(identity)
+    manifest_path, results_path = output / "manifest.json", output / "results.jsonl"
+    if manifest_path.exists():
+        if json.loads(manifest_path.read_text())["run_id"] != run_id:
+            raise ValueError("Resume identity mismatch: configuration, dataset, code or packages changed; "
+                             "use a new output directory")
+    else:
+        if results_path.exists():
+            raise ValueError("Results exist without a manifest; refusing to adopt them")
+        write_manifest(manifest_path, {"run_id": run_id, "created_utc": datetime.now(timezone.utc).isoformat(),
+                                       "dataset_path": str(Path(dataset_path).absolute()),
+                                       "config_path": str(config.path), **identity})
+    rows = read_results(results_path, repair_tail=True, key="example_id")
+    completed = {row["example_id"] for row in rows}
+    pending = [e for e in examples if e["id"] not in completed]
+    report("dataset_start", f"{len(examples)} prompts: {len(completed)} done, {len(pending)} to run",
+           run_id=run_id, prompts=len(examples), completed=len(completed))
+    if not pending:
+        (output / "summary.json").write_text(json.dumps(summarize_dataset(rows, len(examples)), indent=2) + "\n")
+        return
+    adapter = load_adapter(config, report)
+    options = {**generation_options(config.synthetic_observation), **inversion_options(config, progress_interval)}
+    for number, example in enumerate(pending, len(completed) + 1):
+        label = f"[{number}/{len(examples)}] {example['id']}"
+
+        def prompt_progress(event, message, **fields):
+            report(event, f"{label}: {message}", example_id=example["id"], **fields)
+
+        start = perf_counter()
+        try:  # validate before any expensive work
+            tokens = prompt_tokens(adapter, prompt=example["text"])
+            adapter.with_prompt_length(len(tokens))
+        except ValueError as error:
+            row = {"example_id": example["id"], "status": "skipped", "text": example["text"], "reason": str(error)}
+            prompt_progress("prompt_skipped", f"skipped: {error}")
+        else:
+            result = invert_prompt(tokens, adapter, **options, progress=prompt_progress)
+            row = dataset_row(example, result, perf_counter() - start)
+            prompt_progress("prompt_done", f"{row['recovered_text']!r}, token accuracy {row['token_accuracy']:.3g}, "
+                            f"exact={row['exact_recovery']}", token_accuracy=row["token_accuracy"],
+                            exact_recovery=row["exact_recovery"], seconds=row["runtime_seconds"])
+        row = json_safe(row)
+        append_result(results_path, row)
+        rows.append(row)
+        (output / "summary.json").write_text(json.dumps(summarize_dataset(rows, len(examples)), indent=2) + "\n")
+    summary = summarize_dataset(rows, len(examples))
+    report("dataset_done", f"Finished {summary['completed']} prompts ({summary['skipped']} skipped): "
+           f"exact recovery rate {summary['exact_recovery_rate']}, mean token accuracy {summary['mean_token_accuracy']}",
+           **{k: v for k, v in summary.items() if k != "skipped_reasons"})
+
+
+if __name__ == "__main__":
+    main()

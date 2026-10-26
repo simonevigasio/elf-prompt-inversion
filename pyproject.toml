@@ -20,8 +20,8 @@ dependencies = [
 test = ["torch==2.3.0", "datasets>=2.19"]
 
 [tool.setuptools]
-packages = ["elf_model", "backbone_inversion", "prompt_inversion", "experiments"]
+packages = ["elf_inversion", "elf_inversion.model", "elf_inversion.backbone", "elf_inversion.tokens",
+            "elf_inversion.datasets"]
 
 [tool.setuptools.package-dir]
-backbone_inversion = "backbone-inversion/backbone_inversion"
-prompt_inversion = "prompt-inversion/prompt_inversion"
+elf_inversion = "src/elf_inversion"
