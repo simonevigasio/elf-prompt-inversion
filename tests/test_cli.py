@@ -31,10 +31,9 @@ class PipelineCommandTests(unittest.TestCase):
     def write_config(self, root, **overrides):
         (root / "model.yaml").write_text("{}\n")
         (root / "stage_a.yaml").write_text(yaml.safe_dump({"restarts": 1}))
-        (root / "stage_b.yaml").write_text(yaml.safe_dump({"mode": "projected", "k": 9, "max_iterations": 2}))
+        (root / "stage_b.yaml").write_text(yaml.safe_dump({"mode": "projected", "k": 9, "max_iterations": 2, "seed": 3}))
         config = {"model": "model.yaml", "stage_a": "stage_a.yaml", "stage_b": "stage_b.yaml",
-                  "synthetic_observation": {"observation_layer": 0},
-                  "stage_b_initialization": {"seed": 3}, **overrides}
+                  "synthetic_observation": {"observation_layer": 0}, **overrides}
         (root / "pipeline.yaml").write_text(yaml.safe_dump(config))
         return root / "pipeline.yaml"
 
@@ -43,29 +42,31 @@ class PipelineCommandTests(unittest.TestCase):
         dataset.write_text("".join(json.dumps(row) + "\n" for row in rows))
         return dataset
 
-    def test_stage_b_trials_share_stage_a(self):
+    def test_stage_b_restarts_share_stage_a(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config = self.write_config(root)
             (root / "stage_b.yaml").write_text(yaml.safe_dump({"mode": "projected", "k": 9, "max_iterations": 2,
-                                                               "trials": 3}))
+                                                               "seed": 3, "restarts": 3}))
             dataset = self.write_dataset(root, {"id": "a", "text": "4"})
             with patch("elf_inversion.model.adapter.ELFAdapter.from_config", return_value=text_adapter()), \
                     patch("elf_inversion.pipeline.recover", wraps=recover) as stage_a:
-                main(["--config", str(config), "--dataset", str(dataset), "--output", str(root / "trials")])
+                main(["--config", str(config), "--dataset", str(dataset), "--output", str(root / "restarts")])
             self.assertEqual(stage_a.call_count, 1)
-            row = json.loads((root / "trials/results.jsonl").read_text())
-            trials = row["stage_b_trials"]
-            self.assertEqual([t["trial"] for t in trials], [0, 1, 2])
-            self.assertEqual([t["seed"] for t in trials], [3, 4, 5])
-            best = min(trials, key=lambda t: (t["final_loss"], t["trial"]))
+            row = json.loads((root / "restarts/results.jsonl").read_text())
+            restarts = row["stage_b_restarts"]
+            self.assertEqual([r["restart"] for r in restarts], [0, 1, 2])
+            self.assertEqual([r["seed"] for r in restarts], [3, 4, 5])
+            best = min(restarts, key=lambda r: (r["final_loss"], r["restart"]))
+            self.assertEqual(row["stage_b_selected_restart"], best["restart"])
             self.assertEqual(row["recovered_tokens"], best["tokens"])
             self.assertEqual(row["exact_recovery"], best["exact_tokens"])
-            manifest = json.loads((root / "trials/manifest.json").read_text())
+            manifest = json.loads((root / "restarts/manifest.json").read_text())
             # Stage files list only overrides; the manifest records every effective value.
             self.assertEqual(manifest["configuration"]["stage_a"]["restarts"], 1)
             self.assertEqual(manifest["configuration"]["stage_a"]["initial_damping"], SolverConfig().initial_damping)
             self.assertEqual(manifest["configuration"]["stage_b"]["candidate_batch_size"], AttackConfig().candidate_batch_size)
+            self.assertEqual(manifest["configuration"]["stage_b"]["restarts"], 3)
 
     def test_dataset_run_skips_invalid_prompts_and_resumes(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -85,8 +86,8 @@ class PipelineCommandTests(unittest.TestCase):
             self.assertEqual(rows["long"]["status"], "skipped")
             self.assertEqual(rows["b"]["true_tokens"], [5, 6])
             self.assertEqual(rows["b"]["prompt_token_count"], 2)
-            self.assertEqual(len(rows["a"]["stage_b_trials"]), 1)
-            self.assertIn("token_accuracy", rows["a"]["stage_b_trials"][0])
+            self.assertEqual(len(rows["a"]["stage_b_restarts"]), 1)
+            self.assertIn("token_accuracy", rows["a"]["stage_b_restarts"][0])
             summary = json.loads((output / "summary.json").read_text())
             self.assertEqual((summary["prompts"], summary["completed"], summary["skipped"], summary["pending"]),
                              (4, 2, 2, 0))
@@ -121,14 +122,12 @@ class PipelineCommandTests(unittest.TestCase):
     def test_config_validation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            # Prompts and explicit start tokens are single-run settings: only the Python API takes them.
+            # Prompts are single-run settings: only the Python API takes them. Stage B's
+            # restarts and seed belong to the stage_b file.
             for overrides in ({"synthetic_observation": {"prompt": "x", "observation_layer": 0}},
                               {"synthetic_observation": {"token_ids": [4], "observation_layer": 0}},
                               {"synthetic_observation": {"noise_seed": 1}},
-                              {"stage_b_initialization": {"tokens": [5]}},
-                              {"stage_b_initialization": {"seed": 1, "tokens": [5]}},
-                              {"stage_b_initialization": {"seed": 1, "trials": 2}},
-                              {"stage_b_initialization": {"seed": True}},
+                              {"stage_b_initialization": {"seed": 1}},
                               {"unknown": 1}):
                 with self.subTest(overrides=overrides), self.assertRaises(ValueError):
                     load_config(self.write_config(root, **overrides))
@@ -138,9 +137,9 @@ class PipelineCommandTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 load_config(config)
             config = self.write_config(root)
-            for trials in (0, True):
-                with self.subTest(trials=trials), self.assertRaisesRegex(ValueError, "trials"):
-                    (root / "stage_b.yaml").write_text(yaml.safe_dump({"mode": "projected", "trials": trials}))
+            for stage_b in ({"restarts": 0}, {"restarts": True}, {"seed": -1}, {"trials": 2}):
+                with self.subTest(stage_b=stage_b), self.assertRaises((ValueError, TypeError)):
+                    (root / "stage_b.yaml").write_text(yaml.safe_dump({"mode": "projected", **stage_b}))
                     load_config(config)
             (root / "stage_b.yaml").write_text(yaml.safe_dump({"mode": "encoder"}))
             with self.assertRaisesRegex(ValueError, "projected"):

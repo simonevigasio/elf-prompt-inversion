@@ -9,9 +9,3 @@ stage_b: ../stage_b/k100.yaml
 synthetic_observation:
   observation_layer: 3
   noise_seed: 100
-
-# Stage B trial t starts from random non-special tokens drawn with seed + t (the number
-# of trials is in the stage_b file).
-stage_b_initialization:
-  seed: 200
-  trials: 5

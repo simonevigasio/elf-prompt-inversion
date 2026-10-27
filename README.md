@@ -94,9 +94,10 @@ iteration and Stage B step, with ETAs) is printed live and saved in
   `text` (one line is fine), e.g. a [Dolly dataset](#prompt-datasets).
 - Different layer: copy a file in `configs/pipeline/` and edit
   `synthetic_observation`.
-- Larger Stage B search: `configs/pipeline/layer_3_k100.yaml` (uses `configs/stage_b/k100.yaml`).
-- Several Stage B random starts on the same Stage A result: set
-  `trials` in the `configs/stage_b/` file.
+- Stage B search size: `configs/pipeline/layer_1.yaml` uses the small
+  `configs/stage_b/k16.yaml`, `layer_3.yaml` the larger `configs/stage_b/k100.yaml`.
+- Random restarts: set `restarts` (and `seed`) in the `configs/stage_a/` or
+  `configs/stage_b/` file; each stage keeps its best restart.
 
 - Device: `--device auto` (default) uses a GPU when JAX finds one, else the CPU;
   `--device cpu` or `--device gpu` forces one (`gpu` fails if none is usable). An
@@ -113,14 +114,14 @@ from elf_inversion import AttackConfig, ELFAdapter, SolverConfig, invert_prompt
 
 adapter = ELFAdapter.from_config(projected=True)
 result = invert_prompt("The small bird flew over the quiet", adapter, observation_layer=3,
-                       search=AttackConfig(k=100), trials=3,
+                       search=AttackConfig(k=100, restarts=3),
                        progress=lambda event, message, **fields: print(message))
 print(result.text, result.evaluation["stage_b_token_accuracy"], result.stage_a.converged)
 ```
 
 Unset options use the dataclass defaults (`SolverConfig`, `AttackConfig`).
 `progress` receives `(event, message, **fields)` for every step; omit it to run silently.
-`start_tokens=[...]` starts Stage B from explicit token IDs (one trial only).
+`start_tokens=[...]` starts Stage B from explicit token IDs (with `restarts=1` only).
 The library never forces a platform: it runs where JAX does (a GPU when the
 `cuda` extra is installed and one is visible). Set `JAX_PLATFORMS=cpu` before
 importing JAX, or call `elf_inversion.runtime.start_jax_backend("cpu")` first, to
@@ -149,8 +150,8 @@ For a hidden state from elsewhere, create a folder with `hidden_state.npy` and a
 ## Pipeline details
 
 A pipeline config names the model, the Stage A and Stage B settings, how each
-dataset prompt's hidden state is generated, and Stage B's starting point. It has
-no prompt: prompts come only from the `--dataset` file.
+dataset prompt's hidden state is generated. It has no prompt: prompts come only
+from the `--dataset` file.
 
 ```yaml
 model: ../model.yaml
@@ -159,17 +160,17 @@ stage_b: ../stage_b/k16.yaml          # or k100.yaml for a larger search
 synthetic_observation:                # how hidden states are generated from prompts
   observation_layer: 3
   noise_seed: 100
-stage_b_initialization:
-  seed: 200                           # random non-special tokens
 ```
 
 The stage files list only values that differ from the `SolverConfig` /
 `AttackConfig` defaults; every run's `manifest.json` records all effective values.
 
-Stage A runs once per hidden state. Stage B then runs `trials` times on Stage A's
-target (`trials: 5` in the `configs/stage_b/` file, default 1), trial `t` starting
-from random tokens drawn with seed `seed + t` (trial 0 matches a single-trial
-run).
+Both stages handle their own random restarts, set in their stage files.
+Stage A (`SolverConfig.restarts`, default 3) keeps the restart with the lowest
+residual. Stage B then runs `restarts` greedy searches on Stage A's target
+(`AttackConfig.restarts`, default 1; `restarts: 5` in `configs/stage_b/k100.yaml`),
+restart `r` starting from random non-special tokens drawn with seed `seed + r`
+(default seed 200), and keeps the lowest final loss. Neither choice uses the truth.
 
 The hidden state comes from ELF's native sampler (first sampling pass, time 0,
 noise seed `noise_seed`). Layer `k` is the state after `k` complete backbone
@@ -189,7 +190,8 @@ inverted (special tokens, too long for ELF's conditioning prefix) are recorded
 as `skipped` with the reason. The directory holds:
 
 - `results.jsonl`: one row per prompt: `recovered_text`, `token_accuracy`,
-  `exact_recovery`, `final_loss`, code errors, Stage A diagnostics and every trial.
+  `exact_recovery`, `final_loss`, code errors, Stage A diagnostics, every Stage B
+  restart (`stage_b_restarts`) and the selected one (`stage_b_selected_restart`).
 - `summary.json`: exact-recovery rate, mean token accuracy, Stage A convergence
   rate, counts of completed, skipped and pending prompts; updated after every prompt.
 - `manifest.json`: run ID, resolved configuration, dataset and source hashes.
@@ -204,8 +206,8 @@ observation.
 
 A low hidden-state residual can coexist with a failed token recovery: Stage A
 matches the observation, and Stage B's greedy search can still stop in a local
-minimum. A larger search (`configs/stage_b/k100.yaml`) or another
-initialization seed can help.
+minimum. A larger search (`configs/stage_b/k100.yaml`), more Stage B `restarts`
+or another `seed` can help.
 
 ## Prompt datasets
 

@@ -193,7 +193,8 @@ class AttackTests(unittest.TestCase):
         for kwargs in ({"k": 0}, {"candidate_batch_size": 0}, {"max_iterations": -1},
                        {"max_candidate_evaluations": 1.5}, {"mode": "invalid"},
                        {"acceptance_atol": float("nan")}, {"stopping_loss_tolerance": -1},
-                       {"progress_interval_seconds": 0}, {"progress_interval_seconds": float("inf")}):
+                       {"progress_interval_seconds": 0}, {"progress_interval_seconds": float("inf")},
+                       {"restarts": 0}, {"restarts": True}, {"seed": -1}):
             with self.assertRaises(ValueError):
                 AttackConfig(**kwargs)
         model = TinyModel()

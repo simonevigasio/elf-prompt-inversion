@@ -19,10 +19,10 @@ synthetic_observation settings (layer, noise seed, ...). Stage A only receives
 the hidden state and its declared metadata; the true prompt and codes are read
 after recovery, only to score the result.
 
-Stage A runs once per hidden state; Stage B runs ``trials`` times (set in the
-stage_b file, default 1) from random starts with seeds ``seed + trial``. The
-reported ``stage_b`` is the trial with the lowest final loss, chosen without
-the truth. The inversion itself lives in elf_inversion.pipeline.
+Each stage handles its own random restarts, set in its stage file: Stage A's
+``restarts`` (SolverConfig) and Stage B's ``restarts`` with start seeds
+``seed + restart`` (AttackConfig). Each stage keeps its best restart, chosen
+without the truth. The inversion itself lives in elf_inversion.pipeline.
 
 A run writes into --output and resumes there when rerun with the same command:
 
@@ -69,10 +69,8 @@ class PipelineConfig:
     path: Path
     model: Path
     solver: SolverConfig
-    search: AttackConfig
-    trials: int  # Stage B runs per Stage A result
+    search: AttackConfig  # includes Stage B's restarts and start seed
     synthetic_observation: dict  # how each dataset prompt's hidden state is generated
-    seed: int  # Stage B start seed of trial 0
     resolved: dict  # every setting, with the stage files inlined, for the manifest
 
 
@@ -80,18 +78,14 @@ def load_config(path):
     """Read a pipeline config; stage and model paths are relative to it."""
     path = Path(path).resolve()
     raw = yaml.safe_load(path.read_text())
-    required = {"model", "stage_a", "stage_b", "synthetic_observation", "stage_b_initialization"}
+    required = {"model", "stage_a", "stage_b", "synthetic_observation"}
     if raw.keys() != required:
         raise ValueError(f"{path}: needs exactly {sorted(required)}")
     # Stage files list only what differs from the SolverConfig/AttackConfig defaults.
     stage_a = yaml.safe_load((path.parent / raw["stage_a"]).read_text()) or {}
     stage_b = yaml.safe_load((path.parent / raw["stage_b"]).read_text()) or {}
     solver = SolverConfig(**stage_a)
-    # trials belongs to the experiment, not to a single attack.
-    search = AttackConfig(**{k: v for k, v in stage_b.items() if k != "trials"})
-    trials = stage_b.get("trials", 1)
-    if isinstance(trials, bool) or not isinstance(trials, int) or trials < 1:
-        raise ValueError("stage_b trials must be an integer >= 1")
+    search = AttackConfig(**stage_b)
     if search.mode != "projected":
         raise ValueError("Stage A recovers projected codes; Stage B must use mode: projected")
     # Prompts come only from the --dataset file, never from the config.
@@ -99,14 +93,9 @@ def load_config(path):
     if not isinstance(synthetic, dict) or synthetic.keys() - SYNTHETIC_KEYS or "observation_layer" not in synthetic:
         raise ValueError(f"synthetic_observation needs observation_layer; allowed keys: {sorted(SYNTHETIC_KEYS)} "
                          "(prompts come from the --dataset file)")
-    initialization = raw["stage_b_initialization"]
-    if not isinstance(initialization, dict) or initialization.keys() != {"seed"} \
-            or isinstance(initialization["seed"], bool) or not isinstance(initialization["seed"], int):
-        raise ValueError("stage_b_initialization needs exactly an integer seed")
     # The manifest records every effective value, defaults included, not just the file contents.
-    return PipelineConfig(path, (path.parent / raw["model"]).resolve(), solver, search, trials,
-                          synthetic, initialization["seed"],
-                          {**raw, "stage_a": asdict(solver), "stage_b": {**asdict(search), "trials": trials},
+    return PipelineConfig(path, (path.parent / raw["model"]).resolve(), solver, search, synthetic,
+                          {**raw, "stage_a": asdict(solver), "stage_b": asdict(search),
                            "stage_a_file": raw["stage_a"], "stage_b_file": raw["stage_b"]})
 
 
@@ -120,17 +109,19 @@ def generation_options(synthetic):
 
 def inversion_options(config, progress_interval):
     """Keyword arguments of invert_prompt() from a pipeline config."""
-    return {"solver": config.solver, "search": replace(config.search, progress_interval_seconds=progress_interval),
-            "trials": config.trials, "seed": config.seed}
+    return {"solver": config.solver, "search": replace(config.search, progress_interval_seconds=progress_interval)}
 
 
-def trial_records(result: InversionResult):
-    return [{"trial": trial, "seed": result.seeds[trial], "tokens": attempt.tokens, "text": result.texts[trial],
-             "initial_tokens": result.initial_tokens[trial], "final_loss": attempt.final_loss,
-             "stop_reason": attempt.stop_reason, "accepted_moves": len(attempt.accepted_substitutions),
+def restart_records(result: InversionResult):
+    found = result.stage_b
+    if found is None:
+        return []
+    return [{"restart": restart, "seed": found.seeds[restart], "tokens": attempt.tokens, "text": result.texts[restart],
+             "final_loss": attempt.final_loss, "stop_reason": attempt.stop_reason,
+             "accepted_moves": len(attempt.accepted_substitutions),
              "candidate_evaluations": attempt.counters.candidate_evaluations,
              "runtime_seconds": attempt.runtime_seconds}
-            for trial, attempt in enumerate(result.stage_b)]
+            for restart, attempt in enumerate(found.restarts)]
 
 
 def source_hashes():
@@ -202,11 +193,10 @@ def read_dataset(path):
 
 def dataset_row(example, result: InversionResult, seconds):
     recovered, evaluation = result.stage_a, result.evaluation
-    best = None if result.best is None else result.stage_b[result.best]
-    trials = trial_records(result)
-    for trial, scores in zip(trials, evaluation["stage_b_trials"]):
-        trial.update(scores)
-        del trial["initial_tokens"]
+    best = None if result.stage_b is None else result.stage_b.selected
+    restarts = restart_records(result)
+    for restart, scores in zip(restarts, evaluation["stage_b_restarts"]):
+        restart.update(scores)
     return {"example_id": example["id"], "status": "done", "text": example["text"],
             "prompt_token_count": int(result.observation.metadata.prompt_length),
             "true_tokens": evaluation["true_tokens"], "recovered_tokens": result.tokens,
@@ -218,7 +208,8 @@ def dataset_row(example, result: InversionResult, seconds):
             "stage_a": {key: getattr(recovered, key) for key in (
                 "method", "converged", "stop_reason", "absolute_residual", "relative_residual",
                 "iterations", "runtime_seconds")},
-            "stage_b_trials": trials, "runtime_seconds": seconds}
+            "stage_b_selected_restart": None if result.stage_b is None else result.stage_b.selected_restart,
+            "stage_b_restarts": restarts, "runtime_seconds": seconds}
 
 
 def summarize_dataset(rows, total):

@@ -33,6 +33,9 @@ class AttackConfig:
     warmup: bool = False
     record_shortlists: bool = False
     progress_interval_seconds: float = 10.0
+    # Used by tokens.search.search: one attack per restart, random start seed + restart.
+    restarts: int = 1
+    seed: int = 200
 
     def __post_init__(self):
         if (type(self.progress_interval_seconds) not in (int, float) or
@@ -40,9 +43,9 @@ class AttackConfig:
             raise ValueError("progress_interval_seconds must be finite and positive")
         if self.mode not in ("encoder", "projected"):
             raise ValueError("mode must be encoder or projected")
-        for name in ("k", "candidate_batch_size", "max_iterations", "max_candidate_evaluations"):
+        for name in ("k", "candidate_batch_size", "max_iterations", "max_candidate_evaluations", "restarts", "seed"):
             value = getattr(self, name)
-            minimum = 1 if name in ("k", "candidate_batch_size") else 0
+            minimum = 1 if name in ("k", "candidate_batch_size", "restarts") else 0
             if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < minimum:
                 raise ValueError(f"{name} must be an integer >= {minimum}")
         for name in ("stopping_loss_tolerance", "acceptance_atol", "acceptance_rtol"):

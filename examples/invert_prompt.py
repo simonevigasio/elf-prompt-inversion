@@ -21,9 +21,10 @@ def show(event, message, **fields):
 
 print("Device:", start_jax_backend(DEVICE))
 adapter = ELFAdapter.from_config(projected=True)
-# The same small search as configs/stage_b/k16.yaml; unset options use the AttackConfig defaults.
-search = AttackConfig(k=100, max_iterations=50, max_candidate_evaluations=10_000, stopping_loss_tolerance=1e-8)
-result = invert_prompt(PROMPT, adapter, observation_layer=LAYER, search=search, trials=1, progress=show)
+# Stage B settings, restarts included; unset options use the AttackConfig defaults.
+search = AttackConfig(k=100, max_iterations=50, max_candidate_evaluations=10_000, stopping_loss_tolerance=1e-8,
+                      restarts=1)
+result = invert_prompt(PROMPT, adapter, observation_layer=LAYER, search=search, progress=show)
 
 print()
 print("True prompt:      ", PROMPT)

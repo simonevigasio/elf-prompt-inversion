@@ -7,16 +7,25 @@ computed from known tokens. One call handles one prompt.
 ```text
 elf_inversion/tokens/
   attack.py      greedy gradient-shortlisted, exact-loss single-token search
+  search.py      random restarts of the attack; keeps the lowest final loss
   data.py        replacement vocabulary and single-prompt validation
 tests/tokens/    search tests on a tiny fake model; no ELF or checkpoints
 ```
 
 ```python
 from elf_inversion.tokens.attack import AttackConfig, attack
+from elf_inversion.tokens.search import search
 
 result = attack(target_codes, initial_tokens, adapter, AttackConfig(mode="projected", k=100))
 result.tokens, result.final_loss, result.stop_reason
+
+found = search(target_codes, adapter, AttackConfig(mode="projected", k=100, restarts=5))
+found.tokens, found.final_loss, found.selected_restart, found.restarts
 ```
+
+`attack` runs one search from given tokens. `search` is Stage B's counterpart of
+Stage A's restarts: `restarts` attacks from random non-special tokens with seeds
+`seed + restart` (both in `AttackConfig`), selecting the lowest final loss.
 
 The attack receives only the target, the initial tokens and the model
 (`elf_inversion.model.adapter.ELFAdapter`); no ground truth. Search
