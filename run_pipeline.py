@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Run the full experiment: ELF hidden state -> Stage A -> Stage B.
+"""Run the full experiment on a dataset of prompts: ELF hidden state -> Stage A -> Stage B.
 
-    python3 run_pipeline.py --config configs/pipeline/layer_3.yaml
-    python3 run_pipeline.py --config configs/pipeline/layer_3.yaml --observation data/observations/<name>
+    python3 run_pipeline.py --config configs/pipeline/layer_3.yaml \\
+        --dataset prompts/example.jsonl --output outputs/pipeline/example
     python3 run_pipeline.py --help
 
 Works from any directory. Re-runs itself with the repository's .venv interpreter
-when one exists. Details: experiments/pipeline.py.
+when one exists. Details: src/elf_inversion/cli.py.
 """
 import os
 from pathlib import Path
@@ -22,6 +22,6 @@ if __name__ == "__main__":
         # Keep the unresolved venv path: resolving its symlink would leave the venv.
         os.execv(venv_python, [str(venv_python), *sys.argv])
     sys.path.insert(0, str(ROOT))
-    from experiments.pipeline import main
+    from elf_inversion.cli import main
 
     sys.exit(main())

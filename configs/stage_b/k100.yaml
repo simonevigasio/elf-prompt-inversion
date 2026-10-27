@@ -1,13 +1,12 @@
 # Stage B: larger greedy token search (100 candidates per position, 50 accepted swaps).
+# Unlisted settings use the AttackConfig defaults (src/elf_inversion/tokens/attack.py).
 # Keep max_candidate_evaluations >= prompt_length * k * max_iterations; an iteration
 # starts only when its whole shortlist fits the remaining budget.
-mode: projected
 k: 100
-candidate_batch_size: 32
 max_iterations: 50
 # 8 positions * 100 candidates * 50 iterations.
 max_candidate_evaluations: 40000
 stopping_loss_tolerance: 1.0e-8
-# Pipeline only: Stage B runs from this many random starts on one Stage A result
-# (seeds stage_b_initialization.seed + trial); report.json keeps all, "stage_b" is the lowest loss.
-trials: 1
+# Random restarts on one Stage A result, start seeds seed + restart (default seed 200);
+# the lowest final loss wins. max_candidate_evaluations is per restart.
+restarts: 5
