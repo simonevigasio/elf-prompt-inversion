@@ -5,8 +5,11 @@
 k: 100
 max_iterations: 50
 # 8 positions * 100 candidates * 50 iterations.
-max_candidate_evaluations: 40000
+max_candidate_evaluations: 150000
 stopping_loss_tolerance: 1.0e-8
 # Random restarts on one Stage A result, start seeds seed + restart (default seed 200);
 # the lowest final loss wins. max_candidate_evaluations is per restart.
 restarts: 5
+# A restart whose loss reaches stopping_loss_tolerance ends the search (remaining restarts
+# are skipped). Set false to always run every restart.
+stop_restarts_at_tolerance: true
