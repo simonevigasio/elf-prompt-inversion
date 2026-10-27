@@ -10,7 +10,7 @@ from elf_inversion.runtime import start_jax_backend  # before JAX starts: picks 
 
 from elf_inversion import AttackConfig, ELFAdapter, invert_prompt
 
-PROMPT = "The small bird flew over the quiet"
+PROMPT = "Sinner is the greatest of all time"
 LAYER = 3        # hidden state after this many backbone blocks
 DEVICE = "auto"  # "cpu", "gpu" or "auto" (GPU if available)
 
@@ -22,7 +22,7 @@ def show(event, message, **fields):
 print("Device:", start_jax_backend(DEVICE))
 adapter = ELFAdapter.from_config(projected=True)
 # The same small search as configs/stage_b/k16.yaml; unset options use the AttackConfig defaults.
-search = AttackConfig(k=16, max_iterations=20, max_candidate_evaluations=10_000, stopping_loss_tolerance=1e-8)
+search = AttackConfig(k=100, max_iterations=50, max_candidate_evaluations=10_000, stopping_loss_tolerance=1e-8)
 result = invert_prompt(PROMPT, adapter, observation_layer=LAYER, search=search, trials=1, progress=show)
 
 print()
