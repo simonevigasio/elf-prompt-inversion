@@ -53,7 +53,8 @@ def append_result(path, row):
 def read_results(path, *, repair_tail=False, key="trial_id"):
     """Recover only an incomplete trailing write, never silently skip a complete row.
 
-    ``key`` names the field that identifies a completed unit of work; duplicates fail.
+    ``key`` names the field, or a tuple of fields, that identifies a completed unit of
+    work; duplicates fail.
     """
     if not Path(path).exists():
         return []
@@ -73,7 +74,7 @@ def read_results(path, *, repair_tail=False, key="trial_id"):
                 print("Discarded incomplete trailing result write; it will be rerun.", flush=True)
                 break
             rows.append(json.loads(line))
-    keys = [r[key] for r in rows]
+    keys = [tuple(r[k] for k in key) if isinstance(key, tuple) else r[key] for r in rows]
     if len(keys) != len(set(keys)):
         raise ValueError(f"Duplicate completed {key} values")
     return rows

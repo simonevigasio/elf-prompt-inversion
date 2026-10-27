@@ -10,8 +10,9 @@ import yaml
 
 from elf_inversion.backbone.recovery import recover
 from elf_inversion.backbone.solver import SolverConfig
-from elf_inversion.cli import load_config, main
+from elf_inversion.cli import load_config, main, repetition_seeds
 from elf_inversion.model.testing import tiny_native_adapter
+from elf_inversion.pipeline import invert_prompt
 from elf_inversion.tokens.attack import AttackConfig
 
 
@@ -56,7 +57,9 @@ class PipelineCommandTests(unittest.TestCase):
             row = json.loads((root / "restarts/results.jsonl").read_text())
             restarts = row["stage_b_restarts"]
             self.assertEqual([r["restart"] for r in restarts], [0, 1, 2])
-            self.assertEqual([r["seed"] for r in restarts], [3, 4, 5])
+            base = repetition_seeds(load_config(config), "a", 0)["stage_b"]
+            self.assertEqual(row["seeds"]["stage_b"], base)
+            self.assertEqual([r["seed"] for r in restarts], [base, base + 1, base + 2])
             best = min(restarts, key=lambda r: (r["final_loss"], r["restart"]))
             self.assertEqual(row["stage_b_selected_restart"], best["restart"])
             self.assertEqual(row["recovered_tokens"], best["tokens"])
@@ -109,6 +112,42 @@ class PipelineCommandTests(unittest.TestCase):
                     main([*command, option, "4"])
             with self.assertRaises(SystemExit):  # prompts come only from a dataset file
                 main(["--config", str(config), "--output", str(output)])
+
+    def test_repetitions_derive_seeds_and_key_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.write_config(root, repetitions=2)
+            dataset = self.write_dataset(root, {"id": "a", "text": "4"}, {"id": "b", "text": "5"})
+            output = root / "repeated"
+            command = ["--config", str(config), "--dataset", str(dataset), "--output", str(output)]
+            with patch("elf_inversion.model.adapter.ELFAdapter.from_config", return_value=text_adapter()), \
+                    patch("elf_inversion.cli.invert_prompt", wraps=invert_prompt) as invert:
+                main(command)
+            rows = [json.loads(line) for line in (output / "results.jsonl").read_text().splitlines()]
+            self.assertEqual([(r["example_id"], r["repetition"]) for r in rows],
+                             [("a", 0), ("a", 1), ("b", 0), ("b", 1)])
+            loaded = load_config(config)
+            for row, call in zip(rows, invert.call_args_list):
+                seeds = repetition_seeds(loaded, row["example_id"], row["repetition"])
+                self.assertEqual(row["seeds"], seeds)
+                self.assertEqual(call.kwargs["noise_seed"], seeds["noise"])
+                self.assertEqual(call.kwargs["solver"].seed, seeds["stage_a"])
+                self.assertEqual(call.kwargs["search"].seed, seeds["stage_b"])
+            # Every seed differs across prompts, repetitions and purposes, and is stable.
+            values = [v for r in rows for v in r["seeds"].values()]
+            self.assertEqual(len(set(values)), len(values))
+            self.assertEqual(repetition_seeds(loaded, "a", 1), rows[1]["seeds"])
+            summary = json.loads((output / "summary.json").read_text())
+            self.assertEqual((summary["prompts"], summary["repetitions"], summary["runs"], summary["completed"],
+                              summary["pending"]), (2, 2, 4, 4, 0))
+
+            # Raising repetitions is a new experiment: refused in the same directory.
+            self.write_config(root, repetitions=3)
+            with self.assertRaisesRegex(ValueError, "Resume identity mismatch"):
+                main(command)
+            for repetitions in (0, True, 1.5):
+                with self.subTest(repetitions=repetitions), self.assertRaises(ValueError):
+                    load_config(self.write_config(root, repetitions=repetitions))
 
     def test_repository_configs_load(self):
         # PyYAML reads e.g. 1.0e12 (no exponent sign) as a string; catch such typos here.

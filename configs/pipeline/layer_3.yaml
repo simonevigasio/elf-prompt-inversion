@@ -9,3 +9,8 @@ stage_b: ../stage_b/k100.yaml
 synthetic_observation:
   observation_layer: 3
   noise_seed: 100
+
+# Runs per prompt. Repetition r of prompt id uses seeds hash(purpose, seed, id, r) for the
+# noise and for Stage A/B starts (the seeds above and in the stage files are salts), so no
+# seed is shared across prompts or repetitions. Results are keyed by (example_id, repetition).
+repetitions: 1

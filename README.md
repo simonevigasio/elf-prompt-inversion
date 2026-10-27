@@ -98,6 +98,8 @@ iteration and Stage B step, with ETAs) is printed live and saved in
   `configs/stage_b/k16.yaml`, `layer_3.yaml` the larger `configs/stage_b/k100.yaml`.
 - Random restarts: set `restarts` (and `seed`) in the `configs/stage_a/` or
   `configs/stage_b/` file; each stage keeps its best restart.
+- Repetitions: set `repetitions: R` in the pipeline config to run every prompt
+  `R` times with different seeds ([details](#repetitions-and-seeds)).
 
 - Device: `--device auto` (default) uses a GPU when JAX finds one, else the CPU;
   `--device cpu` or `--device gpu` forces one (`gpu` fails if none is usable). An
@@ -160,6 +162,7 @@ stage_b: ../stage_b/k16.yaml          # or k100.yaml for a larger search
 synthetic_observation:                # how hidden states are generated from prompts
   observation_layer: 3
   noise_seed: 100
+repetitions: 1                        # runs per prompt, each with its own seeds (default 1)
 ```
 
 The stage files list only values that differ from the `SolverConfig` /
@@ -179,6 +182,25 @@ forward map must reproduce it from the true codes. Stage A sees only the hidden
 state and its metadata; Stage B starts from random tokens, never from the truth.
 The truth is read afterwards, only to score the result.
 
+### Repetitions and seeds
+
+A fixed seed would give every prompt the same observation noise and the same
+Stage A/B starts, so scores would depend on that one draw. Instead, repetition
+`r = 0 … R−1` of prompt `id` uses
+
+```text
+noise seed     = hash("noise",   noise_seed,     id, r)
+Stage A seed   = hash("stage_a", stage_a seed,   id, r)
+Stage B seed   = hash("stage_b", stage_b seed,   id, r)
+```
+
+(SHA-256, truncated to 31 bits; `elf_inversion.cli.repetition_seeds`). The
+configured seeds act only as salts, the purpose keeps the three streams
+independent, and restarts still add `+ restart` to their stage's seed. Every
+result row is keyed by `(example_id, repetition)` and records its `seeds`. Since
+each prompt has `R` rows, the summary's means over rows are means over prompts
+and seeds.
+
 ### Experiment directories
 
 `run_pipeline.py` runs the pipeline once per `--dataset` JSONL row (string `id`
@@ -189,11 +211,12 @@ package version is refused; use a new output directory. Prompts that cannot be
 inverted (special tokens, too long for ELF's conditioning prefix) are recorded
 as `skipped` with the reason. The directory holds:
 
-- `results.jsonl`: one row per prompt: `recovered_text`, `token_accuracy`,
+- `results.jsonl`: one row per `(example_id, repetition)`: `seeds`, `recovered_text`, `token_accuracy`,
   `exact_recovery`, `final_loss`, code errors, Stage A diagnostics, every Stage B
   restart (`stage_b_restarts`) and the selected one (`stage_b_selected_restart`).
 - `summary.json`: exact-recovery rate, mean token accuracy, Stage A convergence
-  rate, counts of completed, skipped and pending prompts; updated after every prompt.
+  rate, counts of completed, skipped and pending runs (prompts × repetitions);
+  updated after every run.
 - `manifest.json`: run ID, resolved configuration, dataset and source hashes.
 - `progress.jsonl`: live events, each prefixed with `[i/N] id`. Stage A
   logs every restart and LM iteration (residual vs. target, damping, worst-case

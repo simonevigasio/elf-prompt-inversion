@@ -19,6 +19,10 @@ synthetic_observation settings (layer, noise seed, ...). Stage A only receives
 the hidden state and its declared metadata; the true prompt and codes are read
 after recovery, only to score the result.
 
+Every prompt runs ``repetitions`` times (top-level config key, default 1).
+Repetition ``r`` of prompt ``id`` draws its noise seed and its Stage A and Stage B
+base seeds from ``hash(purpose, configured seed, id, r)`` (see repetition_seeds),
+so no seed is shared across prompts or repetitions and scores average over them.
 Each stage handles its own random restarts, set in its stage file: Stage A's
 ``restarts`` (SolverConfig) and Stage B's ``restarts`` with start seeds
 ``seed + restart`` (AttackConfig). Each stage keeps its best restart, chosen
@@ -26,7 +30,7 @@ without the truth. The inversion itself lives in elf_inversion.pipeline.
 
 A run writes into --output and resumes there when rerun with the same command:
 
-    results.jsonl   one row per prompt: recovered text, scores, Stage A diagnostics
+    results.jsonl   one row per (prompt id, repetition): recovered text, scores, Stage A diagnostics
     summary.json    exact-recovery rate, mean token accuracy, Stage A convergence rate
     manifest.json   configuration, dataset and source hashes (the resume identity)
     progress.jsonl  live progress events (the same lines are printed to the console)
@@ -56,12 +60,13 @@ from .model.adapter import ELFAdapter
 from .observation import prompt_tokens
 from .pipeline import InversionResult, invert_prompt
 from .progress import ProgressLogger
-from .runs import (append_result, digest, file_sha256, json_safe, locked_directory,
+from .runs import (append_result, canonical, digest, file_sha256, json_safe, locked_directory,
                    read_results, write_manifest)
 from .tokens.attack import AttackConfig
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SYNTHETIC_KEYS = {"observation_layer", "noise_seed", "self_cond_cfg_scale", "attention_mask"}
+RESULT_KEY = ("example_id", "repetition")
 
 
 @dataclass(frozen=True)
@@ -71,6 +76,7 @@ class PipelineConfig:
     solver: SolverConfig
     search: AttackConfig  # includes Stage B's restarts and start seed
     synthetic_observation: dict  # how each dataset prompt's hidden state is generated
+    repetitions: int  # runs per prompt, each with seeds derived from (prompt id, repetition)
     resolved: dict  # every setting, with the stage files inlined, for the manifest
 
 
@@ -79,8 +85,11 @@ def load_config(path):
     path = Path(path).resolve()
     raw = yaml.safe_load(path.read_text())
     required = {"model", "stage_a", "stage_b", "synthetic_observation"}
-    if raw.keys() != required:
-        raise ValueError(f"{path}: needs exactly {sorted(required)}")
+    if not required <= raw.keys() <= required | {"repetitions"}:
+        raise ValueError(f"{path}: needs exactly {sorted(required)}, optionally repetitions")
+    repetitions = raw.get("repetitions", 1)
+    if type(repetitions) is not int or repetitions < 1:
+        raise ValueError(f"{path}: repetitions must be an integer >= 1")
     # Stage files list only what differs from the SolverConfig/AttackConfig defaults.
     stage_a = yaml.safe_load((path.parent / raw["stage_a"]).read_text()) or {}
     stage_b = yaml.safe_load((path.parent / raw["stage_b"]).read_text()) or {}
@@ -94,8 +103,8 @@ def load_config(path):
         raise ValueError(f"synthetic_observation needs observation_layer; allowed keys: {sorted(SYNTHETIC_KEYS)} "
                          "(prompts come from the --dataset file)")
     # The manifest records every effective value, defaults included, not just the file contents.
-    return PipelineConfig(path, (path.parent / raw["model"]).resolve(), solver, search, synthetic,
-                          {**raw, "stage_a": asdict(solver), "stage_b": asdict(search),
+    return PipelineConfig(path, (path.parent / raw["model"]).resolve(), solver, search, synthetic, repetitions,
+                          {**raw, "repetitions": repetitions, "stage_a": asdict(solver), "stage_b": asdict(search),
                            "stage_a_file": raw["stage_a"], "stage_b_file": raw["stage_b"]})
 
 
@@ -110,6 +119,30 @@ def generation_options(synthetic):
 def inversion_options(config, progress_interval):
     """Keyword arguments of invert_prompt() from a pipeline config."""
     return {"solver": config.solver, "search": replace(config.search, progress_interval_seconds=progress_interval)}
+
+
+def derived_seed(*parts):
+    """Seed in [0, 2**31) from SHA-256 of ``parts``: stable across processes, unlike hash()."""
+    return int.from_bytes(hashlib.sha256(canonical(list(parts)).encode("utf-8")).digest()[:4], "big") >> 1
+
+
+def repetition_seeds(config, example_id, repetition):
+    """Noise, Stage A and Stage B seeds of one (prompt id, repetition).
+
+    Each is ``hash(purpose, configured seed, id, repetition)``: the purpose keeps the
+    three streams independent (Stage A's start must not reuse the observation's
+    noise key), and the configured seed acts as a global salt. Restarts add to
+    these seeds as before; 2**31 leaves room for them below uint32.
+    """
+    return {"noise": derived_seed("noise", config.synthetic_observation.get("noise_seed", 100), example_id, repetition),
+            "stage_a": derived_seed("stage_a", config.solver.seed, example_id, repetition),
+            "stage_b": derived_seed("stage_b", config.search.seed, example_id, repetition)}
+
+
+def repetition_options(options, seeds):
+    """invert_prompt() keyword arguments with one repetition's seeds."""
+    return {**options, "noise_seed": seeds["noise"], "solver": replace(options["solver"], seed=seeds["stage_a"]),
+            "search": replace(options["search"], seed=seeds["stage_b"])}
 
 
 def restart_records(result: InversionResult):
@@ -191,13 +224,14 @@ def read_dataset(path):
     return rows
 
 
-def dataset_row(example, result: InversionResult, seconds):
+def dataset_row(example, repetition, seeds, result: InversionResult, seconds):
     recovered, evaluation = result.stage_a, result.evaluation
     best = None if result.stage_b is None else result.stage_b.selected
     restarts = restart_records(result)
     for restart, scores in zip(restarts, evaluation["stage_b_restarts"]):
         restart.update(scores)
-    return {"example_id": example["id"], "status": "done", "text": example["text"],
+    return {"example_id": example["id"], "repetition": repetition, "seeds": seeds,
+            "status": "done", "text": example["text"],
             "prompt_token_count": int(result.observation.metadata.prompt_length),
             "true_tokens": evaluation["true_tokens"], "recovered_tokens": result.tokens,
             "recovered_text": result.text, "exact_recovery": evaluation["stage_b_exact_tokens"],
@@ -212,7 +246,7 @@ def dataset_row(example, result: InversionResult, seconds):
             "stage_b_restarts": restarts, "runtime_seconds": seconds}
 
 
-def summarize_dataset(rows, total):
+def summarize_dataset(rows, total, repetitions):
     done = [r for r in rows if r["status"] == "done"]
     skipped = {}
     for row in rows:
@@ -222,16 +256,19 @@ def summarize_dataset(rows, total):
     def mean(values):
         return float(np.mean(values)) if values else None
 
-    return {"prompts": total, "completed": len(done), "skipped": sum(skipped.values()), "skipped_reasons": skipped,
-            "pending": total - len(rows),
+    # Counts are of (prompt, repetition) runs; every prompt has the same number of
+    # repetitions, so the means over runs equal the means of per-prompt means once done.
+    return {"prompts": total, "repetitions": repetitions, "runs": total * repetitions,
+            "completed": len(done), "skipped": sum(skipped.values()), "skipped_reasons": skipped,
+            "pending": total * repetitions - len(rows),
             "exact_recovery_rate": mean([r["exact_recovery"] for r in done]),
             "mean_token_accuracy": mean([r["token_accuracy"] for r in done]),
             "stage_a_convergence_rate": mean([r["stage_a"]["converged"] for r in done]),
             "mean_runtime_seconds": mean([r["runtime_seconds"] for r in done])}
 
 
-def write_dataset_summary(output, rows, total):
-    (output / "summary.json").write_text(json.dumps(summarize_dataset(rows, total), indent=2) + "\n")
+def write_dataset_summary(output, rows, total, repetitions):
+    (output / "summary.json").write_text(json.dumps(summarize_dataset(rows, total, repetitions), indent=2) + "\n")
 
 
 def open_dataset_run(config, dataset_path, output):
@@ -261,7 +298,7 @@ def open_dataset_run(config, dataset_path, output):
 
 
 def run_dataset(config, dataset_path, output, report, progress_interval=10.0):
-    """Invert every dataset prompt into the locked ``output``; completed prompts are skipped on rerun.
+    """Invert every (prompt, repetition) into the locked ``output``; completed ones are skipped on rerun.
 
     Prompts that cannot be inverted (empty, special tokens, longer than ELF's
     conditioning prefix) are recorded as skipped with their reason.
@@ -269,41 +306,44 @@ def run_dataset(config, dataset_path, output, report, progress_interval=10.0):
     examples = read_dataset(dataset_path)
     run_id = open_dataset_run(config, dataset_path, output)
     results_path = output / "results.jsonl"
-    rows = read_results(results_path, repair_tail=True, key="example_id")
-    completed = {row["example_id"] for row in rows}
-    pending = [e for e in examples if e["id"] not in completed]
-    report("dataset_start", f"{len(examples)} prompts: {len(completed)} done, {len(pending)} to run",
-           run_id=run_id, prompts=len(examples), completed=len(completed))
+    rows = read_results(results_path, repair_tail=True, key=RESULT_KEY)
+    completed = {tuple(row[k] for k in RESULT_KEY) for row in rows}
+    total, repetitions = len(examples), config.repetitions
+    pending = [(e, r) for e in examples for r in range(repetitions) if (e["id"], r) not in completed]
+    report("dataset_start", f"{total} prompts x {repetitions} repetitions: {len(completed)} done, "
+           f"{len(pending)} to run", run_id=run_id, prompts=total, repetitions=repetitions, completed=len(completed))
     if not pending:
-        write_dataset_summary(output, rows, len(examples))
+        write_dataset_summary(output, rows, total, repetitions)
         return
     adapter = load_adapter(config, report)
     options = {**generation_options(config.synthetic_observation), **inversion_options(config, progress_interval)}
-    for number, example in enumerate(pending, len(completed) + 1):
-        label = f"[{number}/{len(examples)}] {example['id']}"
+    for number, (example, repetition) in enumerate(pending, len(completed) + 1):
+        label = f"[{number}/{total * repetitions}] {example['id']} r={repetition}"
+        seeds = repetition_seeds(config, example["id"], repetition)
 
         def prompt_progress(event, message, **fields):
-            report(event, f"{label}: {message}", example_id=example["id"], **fields)
+            report(event, f"{label}: {message}", example_id=example["id"], repetition=repetition, **fields)
 
         start = perf_counter()
         try:  # validate before any expensive work
             tokens = prompt_tokens(adapter, prompt=example["text"])
             adapter.with_prompt_length(len(tokens))
         except ValueError as error:
-            row = {"example_id": example["id"], "status": "skipped", "text": example["text"], "reason": str(error)}
+            row = {"example_id": example["id"], "repetition": repetition, "status": "skipped",
+                   "text": example["text"], "reason": str(error)}
             prompt_progress("prompt_skipped", f"skipped: {error}")
         else:
-            result = invert_prompt(tokens, adapter, **options, progress=prompt_progress)
-            row = dataset_row(example, result, perf_counter() - start)
+            result = invert_prompt(tokens, adapter, **repetition_options(options, seeds), progress=prompt_progress)
+            row = dataset_row(example, repetition, seeds, result, perf_counter() - start)
             prompt_progress("prompt_done", f"{row['recovered_text']!r}, token accuracy {row['token_accuracy']:.3g}, "
                             f"exact={row['exact_recovery']}", token_accuracy=row["token_accuracy"],
                             exact_recovery=row["exact_recovery"], seconds=row["runtime_seconds"])
         row = json_safe(row)
         append_result(results_path, row)
         rows.append(row)
-        write_dataset_summary(output, rows, len(examples))
-    summary = summarize_dataset(rows, len(examples))
-    report("dataset_done", f"Finished {summary['completed']} prompts ({summary['skipped']} skipped): "
+        write_dataset_summary(output, rows, total, repetitions)
+    summary = summarize_dataset(rows, total, repetitions)
+    report("dataset_done", f"Finished {summary['completed']} runs ({summary['skipped']} skipped): "
            f"exact recovery rate {summary['exact_recovery_rate']}, mean token accuracy {summary['mean_token_accuracy']}",
            **{k: v for k, v in summary.items() if k != "skipped_reasons"})
 
