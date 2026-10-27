@@ -5,6 +5,7 @@ One attack handles one prompt. Targets are [1, length, dimension] (or
 No ground-truth tokens are accepted by this module.
 """
 from dataclasses import dataclass, replace
+from itertools import islice
 from time import perf_counter
 from typing import Iterable, Literal
 
@@ -242,27 +243,85 @@ def _best_candidate(evaluator, center, replacements, config, counters, *, diagno
     return best, best_loss
 
 
+def _neighborhood_size(tokens, positions, allowed):
+    """Single-token substitutions available at ``positions`` (all allowed tokens but the current one)."""
+    return sum(int(np.count_nonzero(allowed != tokens[p])) for p in positions)
+
+
+def _shortlist_size(tokens, positions, allowed, k):
+    """Candidates one search iteration evaluates: up to K per position."""
+    return sum(min(k, int(np.count_nonzero(allowed != tokens[p]))) for p in positions)
+
+
 def _diagnose(evaluator, center, center_loss, positions, allowed, config, counters, progress=None):
     start = perf_counter()
     center = center.copy()
-    size = sum(int(np.count_nonzero(allowed != center[p])) for p in positions)
+    size = _neighborhood_size(center, positions, allowed)
     remaining = config.max_candidate_evaluations - counters.candidate_evaluations
     count = min(size, remaining)
-
-    def replacements():
-        emitted = 0
-        for position in positions:
-            for token in allowed:
-                if token != center[position]:
-                    if emitted >= count:
-                        return
-                    yield Replacement(int(position), int(token))
-                    emitted += 1
-
-    best, loss = _best_candidate(evaluator, center, replacements(), config, counters, diagnostic=True, progress=progress, total=count)
+    # Position-major, then token order; truncated to the remaining budget.
+    replacements = islice((Replacement(int(position), int(token))
+                           for position in positions for token in allowed if token != center[position]),
+                          max(count, 0))
+    best, loss = _best_candidate(evaluator, center, replacements, config, counters, diagnostic=True,
+                                 progress=progress, total=count)
     return NeighborhoodDiagnostic(center, center_loss, best, loss if best else None,
                                   best is not None and _strict_improvement(center_loss, loss, config),
                                   count == size, size, count, perf_counter() - start)
+
+
+def _setup(model, target_codes, tokens, config):
+    """Prompt tokens, editable positions, replacement vocabulary and loss evaluator for one prompt."""
+    batch = single_prompt(model, tokens)
+    current = np.array(batch.input_ids[0, :batch.prompt_length], dtype=np.int32)
+    positions = np.flatnonzero(np.asarray(batch.editable_mask[0, :batch.prompt_length]))
+    allowed = allowed_vocabulary(model, config.allowed_token_ids)
+    return current, positions, allowed, _Evaluator(model, target_codes, batch, config.mode)
+
+
+def _warmup(evaluator, model, current, positions, allowed, config, report):
+    """Compile every loss batch shape plus the gradient/scoring path; returns the seconds spent.
+
+    These calls neither consume the search budget nor make search decisions.
+    """
+    start = perf_counter()
+    report("warmup_start", "JIT warmup: compiling loss batches, input gradient, and embedding scores")
+    sizes = {_shortlist_size(current, positions, allowed, config.k)}
+    if config.exhaustive_diagnostic:
+        sizes.add(_neighborhood_size(current, positions, allowed))
+        sizes.add(config.max_candidate_evaluations)
+    # Full batches plus each possible final partial batch.
+    batch_sizes = {1}
+    for size in sizes:
+        if size:
+            batch_sizes.add(min(size, config.candidate_batch_size))
+            if size % config.candidate_batch_size:
+                batch_sizes.add(size % config.candidate_batch_size)
+    for size in sorted(batch_sizes):
+        report("warmup_forward_start", f"Warmup encoder/loss forward: batch size {size}", batch_size=size)
+        evaluator.losses(np.repeat(current[None, :], size, axis=0))
+    report("warmup_gradient_start", "Warmup input gradient: forward and backward")
+    gradients = evaluator.gradient(current)
+    report("warmup_scores_start", "Warmup vocabulary embedding scores")
+    shortlist_replacements(current, positions, model.embedding_table, gradients, allowed, config.k)
+    seconds = perf_counter() - start
+    report("warmup_done", f"Warmup finished in {duration(seconds)}", seconds=seconds)
+    return seconds
+
+
+def _stop_reason(loss, positions, shortlist_size, counters, config):
+    """Why the search must stop before another iteration, or None to continue."""
+    if loss <= config.stopping_loss_tolerance:
+        return "loss_tolerance"
+    if not len(positions):
+        return "no_editable_positions"
+    if shortlist_size == 0:
+        return "no_candidates"
+    if counters.iterations >= config.max_iterations:
+        return "max_iterations"
+    if shortlist_size > config.max_candidate_evaluations - counters.candidate_evaluations:
+        return "candidate_budget"
+    return None
 
 
 def attack(target_codes, initial_tokens, model, config: AttackConfig = AttackConfig(), *, progress=None) -> AttackResult:
@@ -285,37 +344,10 @@ def attack(target_codes, initial_tokens, model, config: AttackConfig = AttackCon
     start = perf_counter()
     report("attack_start", f"Attack setup: {config.mode}, up to {config.max_iterations} iterations",
            max_iterations=config.max_iterations, candidate_budget=config.max_candidate_evaluations)
-    batch = single_prompt(model, initial_tokens)
-    current = np.array(batch.input_ids[0, :batch.prompt_length], dtype=np.int32)
-    positions = np.flatnonzero(np.asarray(batch.editable_mask[0, :batch.prompt_length]))
-    allowed = allowed_vocabulary(model, config.allowed_token_ids)
-    evaluator = _Evaluator(model, target_codes, batch, config.mode)
+    current, positions, allowed, evaluator = _setup(model, target_codes, initial_tokens, config)
     warmup_seconds = 0.0
     if config.warmup:
-        warmup_start = perf_counter()
-        report("warmup_start", "JIT warmup: compiling loss batches, input gradient, and embedding scores")
-        # Execute all loss batch shapes and the gradient/scoring path before timing.
-        # These calls neither consume the search budget nor make search decisions.
-        counts = [min(config.k, int(np.count_nonzero(allowed != current[p]))) for p in positions]
-        sizes = {sum(counts)}
-        if config.exhaustive_diagnostic:
-            sizes.add(sum(int(np.count_nonzero(allowed != current[p])) for p in positions))
-            sizes.add(config.max_candidate_evaluations)
-        batch_sizes = {1}
-        for size in sizes:
-            if size:
-                batch_sizes.add(min(size, config.candidate_batch_size))
-                if size % config.candidate_batch_size:
-                    batch_sizes.add(size % config.candidate_batch_size)
-        for size in sorted(batch_sizes):
-            report("warmup_forward_start", f"Warmup encoder/loss forward: batch size {size}", batch_size=size)
-            evaluator.losses(np.repeat(current[None, :], size, axis=0))
-        report("warmup_gradient_start", "Warmup input gradient: forward and backward")
-        gradients = evaluator.gradient(current)
-        report("warmup_scores_start", "Warmup vocabulary embedding scores")
-        shortlist_replacements(current, positions, model.embedding_table, gradients, allowed, config.k)
-        warmup_seconds = perf_counter() - warmup_start
-        report("warmup_done", f"Warmup finished in {duration(warmup_seconds)}", seconds=warmup_seconds)
+        warmup_seconds = _warmup(evaluator, model, current, positions, allowed, config, report)
         start = perf_counter()
     report("initial_loss_start", "Computing initial encoder forward and reconstruction loss")
     counters = ComputationCounters(initial_loss_evaluations=1)
@@ -324,21 +356,9 @@ def attack(target_codes, initial_tokens, model, config: AttackConfig = AttackCon
     history, substitutions, shortlists = [loss], [], []
     iteration_seconds = []
     while True:
-        if loss <= config.stopping_loss_tolerance:
-            reason = "loss_tolerance"
-            break
-        if not len(positions):
-            reason = "no_editable_positions"
-            break
-        shortlist_size = sum(min(config.k, int(np.count_nonzero(allowed != current[p]))) for p in positions)
-        if shortlist_size == 0:
-            reason = "no_candidates"
-            break
-        if counters.iterations >= config.max_iterations:
-            reason = "max_iterations"
-            break
-        if shortlist_size > config.max_candidate_evaluations - counters.candidate_evaluations:
-            reason = "candidate_budget"
+        shortlist_size = _shortlist_size(current, positions, allowed, config.k)
+        reason = _stop_reason(loss, positions, shortlist_size, counters, config)
+        if reason is not None:
             break
         iteration_start = perf_counter()
         iteration = counters.iterations + 1
@@ -401,11 +421,7 @@ def exhaustive_single_token_neighborhood(target_codes, center_tokens, model,
     truncates enumeration, complete=False: this is not a local-optimality claim.
     K, iteration limit and stopping loss do not restrict this diagnostic.
     """
-    batch = single_prompt(model, center_tokens)
-    center = np.array(batch.input_ids[0, :batch.prompt_length], dtype=np.int32)
-    positions = np.flatnonzero(np.asarray(batch.editable_mask[0, :batch.prompt_length]))
-    allowed = allowed_vocabulary(model, config.allowed_token_ids)
-    evaluator = _Evaluator(model, target_codes, batch, config.mode)
+    center, positions, allowed, evaluator = _setup(model, target_codes, center_tokens, config)
     counters = ComputationCounters(initial_loss_evaluations=1)
     loss = float(evaluator.losses(center[None, :])[0])
     return _diagnose(evaluator, center, loss, positions, allowed, config, counters), counters

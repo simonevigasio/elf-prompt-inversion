@@ -67,9 +67,7 @@ def observe(adapter, tokens, metadata: ForwardMetadata, *, noise_seed=100):
     batch = adapter.prepare_token_ids(tokens)
     if batch.input_ids.shape[0] != 1:
         raise ValueError("One synthetic example at a time")
-    c = adapter.native["encoder"].encode_text(
-        batch.input_ids, batch.encoder_attention_mask, adapter.encoder.apply,
-        adapter.encoder_params, adapter.config.latent_mean, adapter.config.latent_std)
+    c = adapter.encode_text(batch)
     noise = jax.random.normal(jax.random.PRNGKey(noise_seed), c.shape) * adapter.config.denoiser_noise_scale
     z = adapter.native["sampling"].restore_cond(noise, c, batch.cond_seq_mask)
     captured = {}

@@ -25,43 +25,66 @@ Mode = Literal["encoder", "projected"]
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_SETTINGS = REPO_ROOT / "configs" / "model.yaml"
 
+# Upstream ELF modules used here, by short name; they live under <ELF>/src.
+NATIVE_MODULES = {
+    "t5": "modules.t5_encoder", "model": "modules.model",
+    "encoder": "utils.encoder_utils", "checkpoint": "utils.checkpoint_utils",
+    "config": "configs.config", "sampling": "utils.sampling_utils",
+}
+NATIVE_PACKAGES = {"modules", "utils", "configs"}
+# Native T5 encoder config fields that the embedding-input encoder stack needs.
+ENCODER_STACK_FIELDS = ("num_layers", "d_model", "d_kv", "d_ff", "num_heads", "vocab_size",
+                        "dropout_rate", "layer_norm_epsilon", "is_gated_act", "dtype")
+# Released checkpoint config fields that must equal the pinned source configuration.
+RELEASE_CONFIG_FIELDS = ("encoder_model_name", "encoder_checkpoint", "latent_mean", "latent_std",
+                         "model", "bottleneck_dim", "max_length", "max_input_length", "pad_token",
+                         "num_time_tokens", "num_self_cond_cfg_tokens", "num_model_mode_tokens",
+                         "self_cond_prob")
+
+
+def _check_pinned_commit(root: Path, expected_commit: str):
+    commit = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
+    if commit != expected_commit:
+        raise ValueError(f"ELF commit mismatch: {commit} != {expected_commit}")
+    if subprocess.check_output(["git", "-C", str(root), "diff", "HEAD", "--", "src"], text=True):
+        raise ValueError("ELF tracked source differs from the pinned commit")
+
+
+def _check_native_namespaces_free(src: Path):
+    """ELF's generic top-level packages must not already be imported from elsewhere."""
+    def inside(path):
+        return Path(path).resolve().is_relative_to(src)
+
+    for name, module in tuple(sys.modules.items()):
+        if name.split(".")[0] not in NATIVE_PACKAGES:
+            continue
+        concrete = getattr(module, "__file__", None)
+        # Namespace packages may also include this project's empty configs/
+        # directory; concrete imported modules must always originate in ELF.
+        if concrete:
+            foreign = not inside(concrete)
+        else:
+            paths = list(getattr(module, "__path__", []))
+            foreign = bool(paths) and not any(inside(p) for p in paths)
+        if foreign:
+            raise RuntimeError(f"Import namespace {name} is already occupied by non-ELF code")
+
 
 def native_modules(root: Path, expected_commit: str | None = None):
     """Import upstream read-only; reject ambiguous imports or changed tracked source."""
-
     root = root.resolve()
     if expected_commit:
-        commit = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
-        if commit != expected_commit:
-            raise ValueError(f"ELF commit mismatch: {commit} != {expected_commit}")
-        if subprocess.check_output(["git", "-C", str(root), "diff", "HEAD", "--", "src"], text=True):
-            raise ValueError("ELF tracked source differs from the pinned commit")
+        _check_pinned_commit(root, expected_commit)
 
     src = root / "src"
     if not (src / "modules/t5_encoder.py").is_file():
         raise FileNotFoundError(f"ELF source missing at {src}")
-
-    for name, module in tuple(sys.modules.items()):
-        if name.split(".")[0] in {"modules", "utils", "configs"}:
-            paths = list(getattr(module, "__path__", []))
-            if getattr(module, "__file__", None):
-                paths.append(module.__file__)
-            # Namespace packages may also include this project's empty configs/
-            # directory; concrete imported modules must always originate in ELF.
-            concrete = getattr(module, "__file__", None)
-            if ((concrete and not Path(concrete).resolve().is_relative_to(src)) or
-                    (not concrete and paths and not any(Path(p).resolve().is_relative_to(src) for p in paths))):
-                raise RuntimeError(f"Import namespace {name} is already occupied by non-ELF code")
+    _check_native_namespaces_free(src)
 
     sys.dont_write_bytecode = True  # Do not create __pycache__ in the ELF checkout.
     if str(src) not in sys.path:
         sys.path.insert(0, str(src))
-
-    return {name: importlib.import_module(path) for name, path in {
-        "t5": "modules.t5_encoder", "model": "modules.model",
-        "encoder": "utils.encoder_utils", "checkpoint": "utils.checkpoint_utils",
-        "config": "configs.config", "sampling": "utils.sampling_utils",
-    }.items()}
+    return {name: importlib.import_module(path) for name, path in NATIVE_MODULES.items()}
 
 
 def read_settings(path: str | Path = DEFAULT_SETTINGS):
@@ -75,6 +98,52 @@ def read_settings(path: str | Path = DEFAULT_SETTINGS):
 
 def frozen_params(params):
     return flax.core.freeze(jax.tree_util.tree_map(lambda x: jax.lax.stop_gradient(jnp.asarray(x)), params))
+
+
+def _native_config(native, config_path: Path):
+    """ELF's Config defaults with the training YAML's overrides, as upstream does.
+
+    Unlike upstream, sampling schedules are not loaded relative to the cwd; no
+    sampler or training state is needed here.
+    """
+    with open(config_path) as f:
+        overrides = yaml.safe_load(f)
+    config = native["config"].Config()
+    for key, value in overrides.items():
+        if hasattr(config, key):
+            setattr(config, key, value)
+    return config
+
+
+def _load_denoiser_params(native, config, spec, offline):
+    """EMA parameters of the released denoiser, checked against the source config.
+
+    Returns the parameters and their provenance (checkpoint path, step, epoch).
+    """
+    from huggingface_hub import snapshot_download
+
+    snapshot = Path(snapshot_download(
+        repo_id=spec["repo"], revision=spec["revision"],
+        cache_dir=os.path.expanduser(spec["cache_dir"]), local_files_only=offline,
+        allow_patterns=[spec["checkpoint"] + "/**", spec["config"]],
+    ))
+    with open(snapshot / spec["config"]) as f:
+        release_config = yaml.safe_load(f)
+    for key in RELEASE_CONFIG_FIELDS:
+        if release_config[key] != getattr(config, key):
+            raise ValueError(f"Checkpoint/source configuration mismatch: {key}")
+    checkpoint_path = str(snapshot / spec["checkpoint"])
+    # Use ELF's actual file/msgpack/Orbax restoration dispatcher. target=None
+    # avoids initializing random model parameters and optimizer slots.
+    state = native["checkpoint"]._restore_checkpoint(checkpoint_path, target=None)
+    # Released inference checkpoints omit opt_state. ELF's training-state
+    # validator requires it, so validate the inference payload explicitly.
+    required = {"params", spec["parameters"], "step", "epoch"}
+    if not isinstance(state, dict) or not required.issubset(state):
+        raise ValueError(f"Invalid ELF inference checkpoint; required keys: {sorted(required)}")
+    params = state[spec["parameters"]]  # ELF generation uses EMA, not raw params.
+    return params, {"checkpoint_path": checkpoint_path, "step": int(state["step"]),
+                    "epoch": float(state["epoch"])}
 
 
 @dataclass(frozen=True)
@@ -117,12 +186,7 @@ class ELFAdapter:
             raise ValueError("Missing configured padding token")
 
         ec = encoder.config
-        self.stack = native["t5"].T5EncoderLikeStack(**{
-            key: getattr(ec, key) for key in (
-                "num_layers", "d_model", "d_kv", "d_ff", "num_heads", "vocab_size",
-                "dropout_rate", "layer_norm_epsilon", "is_gated_act", "dtype",
-            )
-        })
+        self.stack = native["t5"].T5EncoderLikeStack(**{key: getattr(ec, key) for key in ENCODER_STACK_FIELDS})
 
         if self.embedding_table.shape != (ec.vocab_size, ec.d_model):
             raise ValueError("Encoder embedding shape does not match native configuration")
@@ -133,28 +197,19 @@ class ELFAdapter:
     @classmethod
     def from_config(cls, path=DEFAULT_SETTINGS, *, projected=True,
                     local_files_only=None):
-        from huggingface_hub import hf_hub_download, snapshot_download
+        from huggingface_hub import hf_hub_download
         from transformers import AutoTokenizer
 
         settings = read_settings(path)
-        root = settings["elf_root"]
-        native = native_modules(root, settings["elf_commit"])
-
-        with open(root / settings["elf_config"]) as f:
-            cfg_dict = yaml.safe_load(f)
-
-        config = native["config"].Config()
-        # Same Config defaults + YAML overrides as upstream, without loading sampling
-        # schedules relative to cwd; no sampler or training state is needed here.
-        for key, value in cfg_dict.items():
-            if hasattr(config, key):
-                setattr(config, key, value)
+        native = native_modules(settings["elf_root"], settings["elf_commit"])
+        config = _native_config(native, settings["elf_root"] / settings["elf_config"])
         offline = settings["local_files_only"] if local_files_only is None else local_files_only
         tok_spec, enc_spec = settings["tokenizer"], settings["encoder"]
         if tok_spec["repo"] != (config.tokenizer_name or config.encoder_model_name):
             raise ValueError("Tokenizer differs from ELF configuration")
         if f'{enc_spec["repo"]}/{enc_spec["filename"]}' != config.encoder_checkpoint:
             raise ValueError("Encoder checkpoint differs from ELF configuration")
+
         tokenizer = AutoTokenizer.from_pretrained(
             tok_spec["repo"], revision=tok_spec["revision"], local_files_only=offline,
         )
@@ -164,34 +219,12 @@ class ELFAdapter:
         enc_params = native["checkpoint"].load_encoder_checkpoint(enc_path)
         provenance = {"elf_commit": settings["elf_commit"], "tokenizer": tok_spec,
                       "encoder": enc_spec, "encoder_path": enc_path}
+
         model, params = None, None
         if projected:
             spec = settings["denoiser"]
-            snapshot = snapshot_download(
-                repo_id=spec["repo"], revision=spec["revision"],
-                cache_dir=os.path.expanduser(spec["cache_dir"]), local_files_only=offline,
-                allow_patterns=[spec["checkpoint"] + "/**", spec["config"]],
-            )
-            with open(Path(snapshot) / spec["config"]) as f:
-                release_config = yaml.safe_load(f)
-            for key in ("encoder_model_name", "encoder_checkpoint", "latent_mean", "latent_std",
-                        "model", "bottleneck_dim", "max_length", "max_input_length", "pad_token",
-                        "num_time_tokens", "num_self_cond_cfg_tokens", "num_model_mode_tokens",
-                        "self_cond_prob"):
-                if release_config[key] != getattr(config, key):
-                    raise ValueError(f"Checkpoint/source configuration mismatch: {key}")
-            ckpt_path = str(Path(snapshot) / spec["checkpoint"])
-            # Use ELF's actual file/msgpack/Orbax restoration dispatcher. target=None
-            # avoids initializing random model parameters and optimizer slots.
-            state = native["checkpoint"]._restore_checkpoint(ckpt_path, target=None)
-            # Released inference checkpoints omit opt_state. ELF's training-state
-            # validator requires it, so validate the inference payload explicitly.
-            required = {"params", spec["parameters"], "step", "epoch"}
-            if not isinstance(state, dict) or not required.issubset(state):
-                raise ValueError(f"Invalid ELF inference checkpoint; required keys: {sorted(required)}")
-            params = state[spec["parameters"]]  # ELF generation uses EMA, not raw params.
-            provenance.update(denoiser=spec, checkpoint_path=ckpt_path,
-                              step=int(state["step"]), epoch=float(state["epoch"]))
+            params, checkpoint_provenance = _load_denoiser_params(native, config, spec, offline)
+            provenance.update(denoiser=spec, **checkpoint_provenance)
             model = native["model"].ELF_models[config.model](
                 text_encoder_dim=ec.d_model, max_length=config.max_length,
                 attn_drop=config.attn_dropout, proj_drop=config.proj_dropout,
@@ -258,12 +291,15 @@ class ELFAdapter:
     def input_embeddings(self, batch: PromptBatch):
         return self.embedding_table[batch.input_ids]
 
-    def encode_token_ids(self, batch: PromptBatch, mode: Mode = "encoder"):
-        c = self.native["encoder"].encode_text(
+    def encode_text(self, batch: PromptBatch):
+        """ELF's normalized encoder states C over the full sequence, via the native encoder."""
+        return self.native["encoder"].encode_text(
             batch.input_ids, batch.encoder_attention_mask, self.encoder.apply,
             self.encoder_params, self.config.latent_mean, self.config.latent_std,
-        )[:, :batch.prompt_length]
-        return self._target(c, mode)
+        )
+
+    def encode_token_ids(self, batch: PromptBatch, mode: Mode = "encoder"):
+        return self._target(self.encode_text(batch)[:, :batch.prompt_length], mode)
 
     def encode_embeddings(self, embeddings, batch: PromptBatch, mode: Mode = "encoder"):
         """Differentiable in editable input embeddings only; model params stay fixed."""
@@ -329,10 +365,7 @@ class ELFAdapter:
         This is an expensive verification oracle, never an inversion inner loop.
         """
         self._projection_params()
-        c = self.native["encoder"].encode_text(
-            batch.input_ids, batch.encoder_attention_mask, self.encoder.apply,
-            self.encoder_params, self.config.latent_mean, self.config.latent_std,
-        )
+        c = self.encode_text(batch)
         captured = []
 
         def apply_fn(variables, x, t, **kwargs):

@@ -43,6 +43,7 @@ Follow a running experiment from another terminal with
 from .runtime import start_jax_backend  # first: sets the CPU default before JAX is imported
 
 import argparse
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 import hashlib
@@ -189,16 +190,17 @@ def main(argv=None):
 
     jax.config.update("jax_default_matmul_precision", "highest")
     device = start_jax_backend()
-    output.mkdir(parents=True, exist_ok=args.dataset is not None)
+    resumable = args.dataset is not None
+    output.mkdir(parents=True, exist_ok=resumable)
     print(f"Results and progress log: {output}", flush=True)
-    if args.dataset is not None:
-        with locked_directory(output), ProgressLogger(output / "progress.jsonl", args.progress_interval) as log:
-            log.report("device", f"JAX device: {device}", device=device)
-            run_dataset(config, args.dataset, output, log.report, args.progress_interval)
-        return
-    with ProgressLogger(output / "progress.jsonl", args.progress_interval) as log:
+    # A resumable dataset directory is locked against a concurrent second runner.
+    lock = locked_directory(output) if resumable else nullcontext()
+    with lock, ProgressLogger(output / "progress.jsonl", args.progress_interval) as log:
         log.report("device", f"JAX device: {device}", device=device)
-        run(config, args.observation, output, log.report, args.progress_interval, prompt=args.prompt)
+        if resumable:
+            run_dataset(config, args.dataset, output, log.report, args.progress_interval)
+        else:
+            run(config, args.observation, output, log.report, args.progress_interval, prompt=args.prompt)
 
 
 def load_adapter(config, report):
@@ -219,29 +221,44 @@ def run(config, observation_dir, output, report, progress_interval=10.0, *, prom
         source = str(Path(observation_dir).absolute())
         report("observation_loaded", f"Loaded observation {source}")
     else:
-        synthetic = config.synthetic_observation
-        if prompt is not None:
-            tokens = prompt_tokens(adapter, prompt=prompt)
-        else:
-            tokens = prompt_tokens(adapter, synthetic.get("prompt"), synthetic.get("token_ids"))
-        options = generation_options(synthetic)
-        report("observation_start", f"Generating the hidden state after {options['observation_layer']} "
-               f"block(s) for {len(tokens)} prompt tokens")
-        observation, adapter = generate(adapter, tokens, **options)
-        save_observation(output / "observation", observation)
+        observation, adapter = generate_observation(config, adapter, prompt, output, report)
         source = "observation/"
-        report("observation_done", "Hidden state generated and saved in observation/")
     result = invert_observation(observation, adapter, **inversion_options(config, progress_interval), progress=report)
-    recovered, metadata = result.stage_a, observation.metadata
+    report_json = run_report(result, source)
+    write_run_files(output, result, report_json, run_manifest(config, adapter, observation, prompt))
+    print_run_summary(result, report_json["stage_b_trials"], output)
 
-    report_json = {"observation": source, "metadata": asdict(metadata),
-                   **{k: v for k, v in asdict(recovered).items()
-                      if k not in {"coordinates", "prompt_code", "noise_code", "stage_b_target"}}}
+
+def generate_observation(config, adapter, prompt, output, report):
+    """Hidden state for ``prompt`` (default: the config's), saved in <output>/observation/."""
+    synthetic = config.synthetic_observation
+    if prompt is not None:
+        tokens = prompt_tokens(adapter, prompt=prompt)
+    else:
+        tokens = prompt_tokens(adapter, synthetic.get("prompt"), synthetic.get("token_ids"))
+    options = generation_options(synthetic)
+    report("observation_start", f"Generating the hidden state after {options['observation_layer']} "
+           f"block(s) for {len(tokens)} prompt tokens")
+    observation, adapter = generate(adapter, tokens, **options)
+    save_observation(output / "observation", observation)
+    report("observation_done", "Hidden state generated and saved in observation/")
+    return observation, adapter
+
+
+def run_report(result: InversionResult, source):
+    """report.json: Stage A diagnostics (without arrays), every Stage B trial, the best one, scores."""
+    arrays = {"coordinates", "prompt_code", "noise_code", "stage_b_target"}
+    report_json = {"observation": source, "metadata": asdict(result.observation.metadata),
+                   **{k: v for k, v in asdict(result.stage_a).items() if k not in arrays}}
     report_json["stage_b_trials"] = trial_records(result)
     report_json["stage_b"] = None if result.best is None else report_json["stage_b_trials"][result.best]
     if result.evaluation is not None:
         report_json["synthetic_evaluation"] = result.evaluation
-    manifest = {
+    return report_json
+
+
+def run_manifest(config, adapter, observation, prompt):
+    return {
         "config_path": config.path, "configuration": config.resolved,
         **({"prompt_override": prompt} if prompt is not None else {}),
         "model_provenance": adapter.provenance,
@@ -251,15 +268,22 @@ def run(config, observation_dir, output, report, progress_interval=10.0, *, prom
         "packages": package_versions(),
         "devices": [str(d) for d in jax.devices()], "precision": "float32/highest",
         "claim": "Forward reconstruction does not establish unique latent or token recovery"}
-    np.savez(output / "recovery.npz", observation=np.asarray(observation.hidden_state),
+
+
+def write_run_files(output, result: InversionResult, report_json, manifest):
+    recovered = result.stage_a
+    np.savez(output / "recovery.npz", observation=np.asarray(result.observation.hidden_state),
              coordinates=np.asarray(recovered.coordinates), prompt_code=np.asarray(recovered.prompt_code),
              noise_code=np.asarray(recovered.noise_code), stage_b_target=np.asarray(recovered.stage_b_target))
     for filename, value in (("report.json", report_json), ("manifest.json", manifest)):
         (output / filename).write_text(json.dumps(json_safe(value), indent=2, allow_nan=False) + "\n")
 
+
+def print_run_summary(result: InversionResult, trials, output):
+    recovered = result.stage_a
     print(f"Stage A: converged={recovered.converged} ({recovered.stop_reason}), "
           f"residual={recovered.absolute_residual:.6g}, relative={recovered.relative_residual:.6g}", flush=True)
-    for trial in report_json["stage_b_trials"]:
+    for trial in trials:
         marker = " (best)" if trial["trial"] == result.best else ""
         print(f"Stage B trial {trial['trial']}: {trial['text']!r}, loss={trial['final_loss']:.6g} "
               f"({trial['stop_reason']}){marker}", flush=True)
@@ -330,6 +354,36 @@ def summarize_dataset(rows, total):
             "mean_runtime_seconds": mean([r["runtime_seconds"] for r in done])}
 
 
+def write_dataset_summary(output, rows, total):
+    (output / "summary.json").write_text(json.dumps(summarize_dataset(rows, total), indent=2) + "\n")
+
+
+def open_dataset_run(config, dataset_path, output):
+    """Run ID of a dataset run; writes the manifest of a new run, refuses a changed one.
+
+    The identity covers configuration, dataset, model settings, source and packages,
+    so a rerun resumes only when all of them are unchanged.
+    """
+    identity = {"kind": "pipeline_dataset", "configuration": json_safe(config.resolved),
+                "dataset_sha256": file_sha256(dataset_path),
+                "model_settings_sha256": file_sha256(config.model),
+                "source_sha256": source_hashes(), "packages": package_versions(),
+                "precision": "float32/highest"}
+    run_id = digest(identity)
+    manifest_path = output / "manifest.json"
+    if manifest_path.exists():
+        if json.loads(manifest_path.read_text())["run_id"] != run_id:
+            raise ValueError("Resume identity mismatch: configuration, dataset, code or packages changed; "
+                             "use a new output directory")
+    else:
+        if (output / "results.jsonl").exists():
+            raise ValueError("Results exist without a manifest; refusing to adopt them")
+        write_manifest(manifest_path, {"run_id": run_id, "created_utc": datetime.now(timezone.utc).isoformat(),
+                                       "dataset_path": str(Path(dataset_path).absolute()),
+                                       "config_path": str(config.path), **identity})
+    return run_id
+
+
 def run_dataset(config, dataset_path, output, report, progress_interval=10.0):
     """Invert every dataset prompt into the locked ``output``; completed prompts are skipped on rerun.
 
@@ -337,30 +391,15 @@ def run_dataset(config, dataset_path, output, report, progress_interval=10.0):
     conditioning prefix) are recorded as skipped with their reason.
     """
     examples = read_dataset(dataset_path)
-    identity = {"kind": "pipeline_dataset", "configuration": json_safe(config.resolved),
-                "dataset_sha256": file_sha256(dataset_path),
-                "model_settings_sha256": file_sha256(config.model),
-                "source_sha256": source_hashes(), "packages": package_versions(),
-                "precision": "float32/highest"}
-    run_id = digest(identity)
-    manifest_path, results_path = output / "manifest.json", output / "results.jsonl"
-    if manifest_path.exists():
-        if json.loads(manifest_path.read_text())["run_id"] != run_id:
-            raise ValueError("Resume identity mismatch: configuration, dataset, code or packages changed; "
-                             "use a new output directory")
-    else:
-        if results_path.exists():
-            raise ValueError("Results exist without a manifest; refusing to adopt them")
-        write_manifest(manifest_path, {"run_id": run_id, "created_utc": datetime.now(timezone.utc).isoformat(),
-                                       "dataset_path": str(Path(dataset_path).absolute()),
-                                       "config_path": str(config.path), **identity})
+    run_id = open_dataset_run(config, dataset_path, output)
+    results_path = output / "results.jsonl"
     rows = read_results(results_path, repair_tail=True, key="example_id")
     completed = {row["example_id"] for row in rows}
     pending = [e for e in examples if e["id"] not in completed]
     report("dataset_start", f"{len(examples)} prompts: {len(completed)} done, {len(pending)} to run",
            run_id=run_id, prompts=len(examples), completed=len(completed))
     if not pending:
-        (output / "summary.json").write_text(json.dumps(summarize_dataset(rows, len(examples)), indent=2) + "\n")
+        write_dataset_summary(output, rows, len(examples))
         return
     adapter = load_adapter(config, report)
     options = {**generation_options(config.synthetic_observation), **inversion_options(config, progress_interval)}
@@ -386,7 +425,7 @@ def run_dataset(config, dataset_path, output, report, progress_interval=10.0):
         row = json_safe(row)
         append_result(results_path, row)
         rows.append(row)
-        (output / "summary.json").write_text(json.dumps(summarize_dataset(rows, len(examples)), indent=2) + "\n")
+        write_dataset_summary(output, rows, len(examples))
     summary = summarize_dataset(rows, len(examples))
     report("dataset_done", f"Finished {summary['completed']} prompts ({summary['skipped']} skipped): "
            f"exact recovery rate {summary['exact_recovery_rate']}, mean token accuracy {summary['mean_token_accuracy']}",

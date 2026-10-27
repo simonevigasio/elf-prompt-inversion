@@ -97,6 +97,31 @@ def relative_residual(absolute, observation_norm):
     return absolute / observation_norm if observation_norm > 0 else absolute
 
 
+def _damped_gauss_newton_step(residual, config):
+    """Jitted (z, damping) -> LM step for ``residual``, solved matrix-free by CG.
+
+    Solves (JᵀJ + damping I) delta = -Jᵀr. Returns the step, CG iterations, CG
+    residual, a breakdown flag and the gradient norm ‖Jᵀr‖.
+    """
+    @jax.jit
+    def step(z, damping):
+        # linearize constructs a reusable JVP; vjp supplies the adjoint.
+        r, jvp = jax.linearize(residual, z)
+        _, vjp = jax.vjp(residual, z)
+        gradient = vjp(r)[0]
+
+        def operator(v):
+            return vjp(jvp(v))[0] + damping * v
+
+        delta, iters, cg_residual, bad = conjugate_gradient(
+            operator, -gradient, rtol=config.cg_rtol, atol=config.cg_atol,
+            max_iterations=config.cg_max_iterations)
+        bad = bad | ~jnp.all(jnp.isfinite(gradient)) | ~jnp.all(jnp.isfinite(delta))
+        return delta, iters, cg_residual, bad, jnp.linalg.norm(gradient)
+
+    return step
+
+
 def levenberg_marquardt(forward, observation, initial, config=SolverConfig(), *, progress=None):
     """Minimize 0.5 ||F(x)-observation||². Damping is not a prior penalty.
 
@@ -120,19 +145,7 @@ def levenberg_marquardt(forward, observation, initial, config=SolverConfig(), *,
         return (forward(z) - y).reshape(-1)
 
     residual_fn = jax.jit(residual)
-
-    @jax.jit
-    def linear_step(z, damping):
-        # linearize constructs a reusable JVP; vjp supplies the adjoint.
-        r, jvp = jax.linearize(residual, z)
-        _, vjp = jax.vjp(residual, z)
-        gradient = vjp(r)[0]
-        operator = lambda v: vjp(jvp(v))[0] + damping * v
-        delta, iters, cg_residual, bad = conjugate_gradient(
-            operator, -gradient, rtol=config.cg_rtol, atol=config.cg_atol,
-            max_iterations=config.cg_max_iterations)
-        bad = bad | ~jnp.all(jnp.isfinite(gradient)) | ~jnp.all(jnp.isfinite(delta))
-        return delta, iters, cg_residual, bad, jnp.linalg.norm(gradient)
+    linear_step = _damped_gauss_newton_step(residual, config)
 
     obs_norm = float(jnp.linalg.norm(y))
     tolerance = config.residual_atol + config.residual_rtol * obs_norm

@@ -13,10 +13,42 @@ class ForwardMetadata:
 
     prompt_length: int
     observation_layer: int = 1
+    # Only the first sampling pass is supported, so time must be 0.0.
     time: float = 0.0
-    self_cond_cfg_scale: float = 1.0 # I don't know what's that
+    # Self-conditioning guidance scale the sampler passes to the backbone; it
+    # enters the hidden state through the scale-token embedding.
+    self_cond_cfg_scale: float = 1.0
     attention_mask: tuple[int, ...] | None = None
-    forward_mode: str = "first_sampling_pass" # time t = 0 (I don't think it is needed)
+    # Which sampler call produced the observation. Only "first_sampling_pass"
+    # (time 0, zero previous prediction) is supported; saving it keeps
+    # observation files explicit about the pass they come from.
+    forward_mode: str = "first_sampling_pass"
+
+
+def validate_metadata(adapter, metadata: ForwardMetadata):
+    """Reject observations this forward map cannot represent."""
+    model = adapter.model
+    if model is None or adapter.model_params is None:
+        raise ValueError("Stage A requires the frozen backbone checkpoint")
+    if metadata.forward_mode != "first_sampling_pass" or metadata.time != 0.0:
+        raise ValueError("Only first_sampling_pass at time=0 with zero previous prediction is supported")
+    if not np.isfinite(metadata.self_cond_cfg_scale):
+        raise ValueError("self_cond_cfg_scale must be finite")
+    if type(metadata.observation_layer) is not int or not 0 <= metadata.observation_layer <= model.depth:
+        raise ValueError("observation_layer must be an integer from 0 through model.depth")
+    if (type(metadata.prompt_length) is not int or
+            not 0 < metadata.prompt_length <= (adapter.config.max_input_length or model.max_length) or
+            metadata.prompt_length >= model.max_length):
+        raise ValueError("A nonempty prefix and nonempty generation suffix are required")
+    if metadata.prompt_length != adapter.prompt_length:
+        raise ValueError("Metadata and Stage B adapter prompt lengths must agree")
+    # The scale tokens carry self_cond_cfg_scale; without them it has no effect on the state.
+    if model.num_self_cond_cfg_tokens <= 0 or "self_cond_proj" not in adapter.model_params:
+        raise ValueError("This implementation requires ELF's self-conditioning scale-token branch")
+    if metadata.attention_mask is not None:
+        mask = np.asarray(metadata.attention_mask)
+        if mask.shape != (model.max_length,) or not np.isin(mask, [0, 1]).all():
+            raise ValueError("attention_mask must contain one binary entry per sequence position")
 
 
 def row_basis(matrix):
@@ -37,30 +69,11 @@ class BackboneForward:
     """
 
     def __init__(self, adapter, metadata: ForwardMetadata):
+        validate_metadata(adapter, metadata)
         self.adapter, self.metadata = adapter, metadata
         model = adapter.model
-        if model is None or adapter.model_params is None:
-            raise ValueError("Stage A requires the frozen backbone checkpoint")
-        if metadata.forward_mode != "first_sampling_pass" or metadata.time != 0.0:
-            raise ValueError("Only first_sampling_pass at time=0 with zero previous prediction is supported")
-        if not np.isfinite(metadata.self_cond_cfg_scale):
-            raise ValueError("self_cond_cfg_scale must be finite")
-        if type(metadata.observation_layer) is not int or not 0 <= metadata.observation_layer <= model.depth:
-            raise ValueError("observation_layer must be an integer from 0 through model.depth")
-        if (type(metadata.prompt_length) is not int or
-                not 0 < metadata.prompt_length <= (adapter.config.max_input_length or model.max_length) or
-                metadata.prompt_length >= model.max_length):
-            raise ValueError("A nonempty prefix and nonempty generation suffix are required")
-        if metadata.prompt_length != adapter.prompt_length:
-            raise ValueError("Metadata and Stage B adapter prompt lengths must agree")
-        if model.num_self_cond_cfg_tokens <= 0 or "self_cond_proj" not in adapter.model_params: # check later in the adapter num_self_cond_cfg_tokens role
-            raise ValueError("This implementation requires ELF's self-conditioning scale-token branch")
-        # check if the given mask has binary entries
-        if metadata.attention_mask is not None:
-            mask = np.asarray(metadata.attention_mask)
-            if mask.shape != (model.max_length,) or not np.isin(mask, [0, 1]).all():
-                raise ValueError("attention_mask must contain one binary entry per sequence position")
-        self.length, self.n = model.max_length, metadata.prompt_length # they must be equal
+        # Text positions in total, and how many of them hold the prompt.
+        self.length, self.n = model.max_length, metadata.prompt_length
         self.prefix_length = model.num_time_tokens + model.num_self_cond_cfg_tokens + model.num_model_mode_tokens
         wb, sc = adapter._projection_params()
         self.prompt_map = adapter.gamma
@@ -103,12 +116,15 @@ class BackboneForward:
             rope = native.TextRotaryEmbeddingFast(
                 dim=model.hidden_size // model.num_heads, pt_seq_len=model.max_length,
                 num_empty_token=context.shape[1] + model.num_model_mode_tokens, name="feat_rope")
-            q1, q3 = model.depth // 4, model.depth // 4 * 3
+            # Mirror native ELF's block construction: only the middle half of the
+            # blocks declares dropout, which is inactive here (deterministic=True).
+            first_dropout, end_dropout = model.depth // 4, model.depth // 4 * 3
             for i in range(layer):
+                has_dropout = first_dropout <= i < end_dropout
                 x = native.ELFBlock(
                     model.hidden_size, model.num_heads, mlp_ratio=model.mlp_ratio,
-                    attn_drop=model.attn_drop if q3 > i >= q1 else 0.0,
-                    proj_drop=model.proj_drop if q3 > i >= q1 else 0.0,
+                    attn_drop=model.attn_drop if has_dropout else 0.0,
+                    proj_drop=model.proj_drop if has_dropout else 0.0,
                     name=f"blocks_{i}",
                 )(x, rope_fn=rope, attention_mask=mask, deterministic=True)
             return x

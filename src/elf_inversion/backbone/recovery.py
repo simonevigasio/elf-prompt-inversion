@@ -32,6 +32,38 @@ class RecoveryResult:
     diagnostics: dict
 
 
+def _algebraic_result(forward, y, coordinates, config, start):
+    """Wrap the layer-0 least-squares solution; consistency is judged by the same tolerance."""
+    absolute = float(jnp.linalg.norm(forward(coordinates) - y))
+    norm = float(jnp.linalg.norm(y))
+    converged = absolute <= config.residual_atol + config.residual_rtol * norm
+    return NumericalResult(coordinates, absolute, relative_residual(absolute, norm), converged,
+                           "residual_tolerance" if converged else "inconsistent_layer_zero_observation",
+                           0, perf_counter() - start, ())
+
+
+def _numerical_restarts(forward, y, config, progress):
+    """One Levenberg-Marquardt solve per restart, seeds config.seed + restart."""
+    def report(event, message, **fields):
+        if progress is not None:
+            progress(event, message, **fields)
+
+    results = []
+    for restart in range(config.restarts):
+        seed = config.seed + restart
+        report("restart_start", f"Stage A restart {restart + 1}/{config.restarts} (seed {seed}); "
+               "the first iteration includes JIT compilation", restart=restart, seed=seed)
+        initial = forward.initialize(seed, config.prompt_init_std)
+        result = levenberg_marquardt(forward, y, initial, config, progress=progress)
+        results.append(result)
+        report("restart_done", f"Stage A restart {restart + 1}/{config.restarts}: "
+               f"residual {result.absolute_residual:.6g}, {result.stop_reason}, "
+               f"{result.iterations} iterations, {result.runtime_seconds:.0f}s",
+               restart=restart, residual=result.absolute_residual, converged=result.converged,
+               stop_reason=result.stop_reason, seconds=result.runtime_seconds)
+    return results
+
+
 def recover(observation, adapter, metadata: ForwardMetadata, config=SolverConfig(), *, progress=None):
     """Recover from H, weights, and public metadata only; independent random starts.
 
@@ -40,44 +72,23 @@ def recover(observation, adapter, metadata: ForwardMetadata, config=SolverConfig
     separately and be labeled as such; it is never selected by this routine.
     ``progress(event, message, **fields)`` optionally reports restarts and LM iterations.
     """
-    def report(event, message, **fields):
-        if progress is not None:
-            progress(event, message, **fields)
-
     start = perf_counter()
     forward = BackboneForward(adapter, metadata)
     y = jnp.asarray(observation, dtype=jnp.float32)
     if y.shape != forward.observation_shape or not np.isfinite(np.asarray(y)).all():
         raise ValueError(f"Expected finite observation with shape {forward.observation_shape}")
-    candidates, summaries = [], []
     algebraic = forward.algebraic(y) if config.algebraic_layer_zero else None
-    method = "algebraic" if algebraic is not None else "levenberg_marquardt"
     if algebraic is not None:
-        absolute = float(jnp.linalg.norm(forward(algebraic) - y))
-        norm = float(jnp.linalg.norm(y))
-        converged = absolute <= config.residual_atol + config.residual_rtol * norm
-        candidates.append(NumericalResult(algebraic, absolute, relative_residual(absolute, norm),
-            converged, "residual_tolerance" if converged else "inconsistent_layer_zero_observation",
-            0, perf_counter() - start, ()))
+        method, candidates = "algebraic", [_algebraic_result(forward, y, algebraic, config, start)]
     else:
-        for restart in range(config.restarts):
-            seed = config.seed + restart
-            report("restart_start", f"Stage A restart {restart + 1}/{config.restarts} (seed {seed}); "
-                   "the first iteration includes JIT compilation", restart=restart, seed=seed)
-            initial = forward.initialize(seed, config.prompt_init_std)
-            result = levenberg_marquardt(forward, y, initial, config, progress=progress)
-            candidates.append(result)
-            report("restart_done", f"Stage A restart {restart + 1}/{config.restarts}: "
-                   f"residual {result.absolute_residual:.6g}, {result.stop_reason}, "
-                   f"{result.iterations} iterations, {result.runtime_seconds:.0f}s",
-                   restart=restart, residual=result.absolute_residual, converged=result.converged,
-                   stop_reason=result.stop_reason, seconds=result.runtime_seconds)
-    for i, result in enumerate(candidates):
-        summaries.append({"restart": i, "seed": None if algebraic is not None else config.seed + i,
-            "absolute_residual": result.absolute_residual, "relative_residual": result.relative_residual,
-            "converged": result.converged, "stop_reason": result.stop_reason,
-            "iterations": result.iterations, "runtime_seconds": result.runtime_seconds,
-            "history": result.history})
+        method, candidates = "levenberg_marquardt", _numerical_restarts(forward, y, config, progress)
+    summaries = [{"restart": i, "seed": None if algebraic is not None else config.seed + i,
+                  "absolute_residual": result.absolute_residual, "relative_residual": result.relative_residual,
+                  "converged": result.converged, "stop_reason": result.stop_reason,
+                  "iterations": result.iterations, "runtime_seconds": result.runtime_seconds,
+                  "history": result.history}
+                 for i, result in enumerate(candidates)]
+    # Lowest finite residual wins; ties keep the earliest restart.
     best = min(range(len(candidates)), key=lambda i: candidates[i].absolute_residual
                if np.isfinite(candidates[i].absolute_residual) else float("inf"))
     result = candidates[best]
