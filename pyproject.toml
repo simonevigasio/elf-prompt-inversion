@@ -16,6 +16,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# NVIDIA GPUs: JAX's CUDA 12 plugin with pip-installed CUDA libraries (Linux only).
+cuda = ["jax[cuda12]==0.4.38"]
 # ELF's native data collator, used by the adapter equivalence tests.
 test = ["torch==2.3.0", "datasets>=2.19"]
 

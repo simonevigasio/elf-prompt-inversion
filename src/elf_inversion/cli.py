@@ -5,8 +5,9 @@
     python run_pipeline.py --config configs/pipeline/layer_3.yaml \\
         --dataset data/dolly/dolly-20-tokens-50.jsonl --output outputs/pipeline/dolly-20
 
-``python -m elf_inversion.cli`` is the same command. It runs on CPU unless
-JAX_PLATFORMS is already set.
+``python -m elf_inversion.cli`` is the same command. --device picks cpu, gpu
+or auto (the default: a GPU when JAX's CUDA plugin finds one, else the CPU;
+JAX_PLATFORMS, if set, wins). See elf_inversion.runtime.
 
 The command is meant for experiments over many prompts: it only reads prompts
 from a JSONL file (rows with string "id" and "text"; one row is fine). To invert
@@ -33,7 +34,7 @@ A run writes into --output and resumes there when rerun with the same command:
 Follow a running experiment from another terminal with
 ``tail -f <output>/progress.jsonl``.
 """
-from .runtime import start_jax_backend  # first: sets the CPU default before JAX is imported
+from .runtime import DEVICES, start_jax_backend
 
 import argparse
 from dataclasses import asdict, dataclass, replace
@@ -150,6 +151,8 @@ def main(argv=None):
                         help="JSONL file of prompts (string id and text, one or more rows)")
     parser.add_argument("--output", type=Path, required=True,
                         help="Results directory; rerunning the same command resumes there")
+    parser.add_argument("--device", choices=DEVICES, default="auto",
+                        help="auto (default): GPU if available, else CPU; cpu or gpu force one")
     parser.add_argument("--progress-interval", type=float, default=10.0,
                         help="Seconds between progress lines and heartbeats during long steps (default 10)")
     args = parser.parse_args(argv)
@@ -161,7 +164,7 @@ def main(argv=None):
     output = args.output.absolute()
 
     jax.config.update("jax_default_matmul_precision", "highest")
-    device = start_jax_backend()
+    device = start_jax_backend(args.device)
     output.mkdir(parents=True, exist_ok=True)
     print(f"Results and progress log: {output}", flush=True)
     # The resumable directory is locked against a concurrent second runner.

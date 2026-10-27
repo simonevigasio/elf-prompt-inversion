@@ -24,7 +24,7 @@ src/elf_inversion/           the library (one installable package)
   observation.py             generate, save and load hidden states
   progress.py, runs.py       live progress logs; durable, resumable result directories
   cli.py                     the dataset command behind run_pipeline.py
-  runtime.py                 the commands' CPU default and JAX start-up
+  runtime.py                 the command's device choice (--device) and JAX start-up
   datasets/                  prompt datasets in the pipeline's JSONL format (dolly.py)
 prompts/                     example.jsonl: a one-prompt dataset for a first run
 tests/                       model/, backbone/, tokens/, test_pipeline.py, test_cli.py, ...
@@ -37,10 +37,25 @@ outputs/                     experiment results (git-ignored)
 Python 3.10–3.12. The official ELF checkout must be next to this repository
 (`../ELF`), at the commit pinned in `configs/model.yaml`.
 
+CPU only:
+
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -e '.[test]'
 ```
+
+NVIDIA GPU (Linux, CUDA 12 driver; the CUDA libraries come from pip). The tests'
+`torch` must be the CPU build, because the CUDA build pins a cuDNN that conflicts
+with JAX's:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install torch==2.3.0 --index-url https://download.pytorch.org/whl/cpu
+.venv/bin/python -m pip install -e '.[cuda,test]'
+.venv/bin/python -c 'import jax; print(jax.devices())'   # expect [CudaDevice(id=0), ...]
+```
+
+Skip the `torch` line and `test` if you do not run the tests.
 
 Experiments load weights offline. Fetch the pinned artifacts once (the De–En
 denoiser checkpoint is large; `denoiser.cache_dir` in `configs/model.yaml`
@@ -83,6 +98,12 @@ iteration and Stage B step, with ETAs) is printed live and saved in
 - Several Stage B random starts on the same Stage A result: set
   `trials` in the `configs/stage_b/` file.
 
+- Device: `--device auto` (default) uses a GPU when JAX finds one, else the CPU;
+  `--device cpu` or `--device gpu` forces one (`gpu` fails if none is usable). An
+  already set `JAX_PLATFORMS` is respected by `auto`. The device is printed and
+  logged at start. JAX reserves 75% of GPU memory up front; set
+  `XLA_PYTHON_CLIENT_PREALLOCATE=false` to share the GPU.
+
 `run_pipeline.py` works from any directory and uses `.venv` automatically.
 
 ## Use it from Python
@@ -100,8 +121,10 @@ print(result.text, result.evaluation["stage_b_token_accuracy"], result.stage_a.c
 Unset options use the dataclass defaults (`SolverConfig`, `AttackConfig`).
 `progress` receives `(event, message, **fields)` for every step; omit it to run silently.
 `start_tokens=[...]` starts Stage B from explicit token IDs (one trial only).
-The library never forces a platform; the command defaults to CPU unless
-`JAX_PLATFORMS` is set (`import elf_inversion.runtime` first to get the same default).
+The library never forces a platform: it runs where JAX does (a GPU when the
+`cuda` extra is installed and one is visible). Set `JAX_PLATFORMS=cpu` before
+importing JAX, or call `elf_inversion.runtime.start_jax_backend("cpu")` first, to
+stay on the CPU.
 
 To keep or reuse a hidden state, generate it, save it and invert it:
 
