@@ -4,15 +4,13 @@ model: ../model.yaml
 stage_a: ../stage_a/levenberg_marquardt.yaml
 stage_b: ../stage_b/k16.yaml
 
-# Synthetic observation, generated when run_pipeline.py gets no --observation.
-# The prompt is only used to create the hidden state and to score the result.
+# How the hidden state of every --dataset prompt is generated. Prompts come only from
+# the dataset file; each is used to create its hidden state and to score the result.
 synthetic_observation:
-  prompt: The small bird flew over the quiet
   observation_layer: 1
   noise_seed: 100
 
 # Stage B trial t starts from random non-special tokens drawn with seed + t (the number
-# of trials is in the stage_b file). Add "tokens: [...]" instead of seed to start from
-# explicit token IDs (one trial only).
+# of trials is in the stage_b file).
 stage_b_initialization:
   seed: 200

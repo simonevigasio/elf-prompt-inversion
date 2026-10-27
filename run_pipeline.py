@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Run the full experiment: ELF hidden state -> Stage A -> Stage B.
+"""Run the full experiment on a dataset of prompts: ELF hidden state -> Stage A -> Stage B.
 
-    python3 run_pipeline.py --config configs/pipeline/layer_3.yaml
-    python3 run_pipeline.py --config configs/pipeline/layer_3.yaml --observation data/observations/<name>
+    python3 run_pipeline.py --config configs/pipeline/layer_3.yaml \\
+        --dataset prompts/example.jsonl --output outputs/pipeline/example
     python3 run_pipeline.py --help
 
 Works from any directory. Re-runs itself with the repository's .venv interpreter

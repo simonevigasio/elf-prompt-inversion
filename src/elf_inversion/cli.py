@@ -1,41 +1,34 @@
-"""Pipeline command: ELF hidden state -> Stage A (bottleneck codes) -> Stage B (tokens).
+"""Pipeline command: invert every prompt of a dataset, ELF hidden state -> Stage A -> Stage B.
 
-    python run_pipeline.py --config configs/pipeline/layer_3.yaml
-    python run_pipeline.py --config configs/pipeline/layer_3.yaml --prompt "A different prompt"
     python run_pipeline.py --config configs/pipeline/layer_3.yaml \\
-        --observation outputs/pipeline/<earlier run>/observation
+        --dataset prompts/example.jsonl --output outputs/pipeline/example
     python run_pipeline.py --config configs/pipeline/layer_3.yaml \\
         --dataset data/dolly/dolly-20-tokens-50.jsonl --output outputs/pipeline/dolly-20
 
 ``python -m elf_inversion.cli`` is the same command. It runs on CPU unless
 JAX_PLATFORMS is already set.
 
-Without --observation, the hidden state is generated from a prompt: the
-config's synthetic_observation prompt, --prompt, or each --dataset row. The
-config's synthetic_observation settings (layer, noise seed, ...) apply to all of
-them. Stage A only receives the hidden state and its declared metadata. The true
-prompt and codes (truth.npz) are read after recovery, only to score the result.
+The command is meant for experiments over many prompts: it only reads prompts
+from a JSONL file (rows with string "id" and "text"; one row is fine). To invert
+a single prompt or a saved hidden state, call elf_inversion.invert_prompt or
+invert_observation from Python.
+
+For each prompt, the hidden state is generated with the config's
+synthetic_observation settings (layer, noise seed, ...). Stage A only receives
+the hidden state and its declared metadata; the true prompt and codes are read
+after recovery, only to score the result.
 
 Stage A runs once per hidden state; Stage B runs ``trials`` times (set in the
 stage_b file, default 1) from random starts with seeds ``seed + trial``. The
 reported ``stage_b`` is the trial with the lowest final loss, chosen without
 the truth. The inversion itself lives in elf_inversion.pipeline.
 
-A single run writes a new directory (default outputs/pipeline/<config>-<UTC time>/):
-
-    observation/    the generated hidden state (synthetic runs only)
-    recovery.npz    observation, recovered coordinates and codes, Stage B target
-    report.json     Stage A diagnostics, Stage B trials, evaluation against truth
-    manifest.json   configuration, model provenance, hashes, versions
-    progress.jsonl  live progress events (the same lines are printed to the console)
-
-A --dataset run (JSONL rows with string "id" and "text") writes into --output
-and resumes there when rerun with the same command:
+A run writes into --output and resumes there when rerun with the same command:
 
     results.jsonl   one row per prompt: recovered text, scores, Stage A diagnostics
     summary.json    exact-recovery rate, mean token accuracy, Stage A convergence rate
     manifest.json   configuration, dataset and source hashes (the resume identity)
-    progress.jsonl  live progress events
+    progress.jsonl  live progress events (the same lines are printed to the console)
 
 Follow a running experiment from another terminal with
 ``tail -f <output>/progress.jsonl``.
@@ -43,7 +36,6 @@ Follow a running experiment from another terminal with
 from .runtime import start_jax_backend  # first: sets the CPU default before JAX is imported
 
 import argparse
-from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 import hashlib
@@ -60,16 +52,15 @@ import elf_inversion
 
 from .backbone.solver import SolverConfig
 from .model.adapter import ELFAdapter
-from .observation import generate, load_observation, prompt_tokens, save_observation
-from .pipeline import InversionResult, invert_observation, invert_prompt
+from .observation import prompt_tokens
+from .pipeline import InversionResult, invert_prompt
 from .progress import ProgressLogger
 from .runs import (append_result, digest, file_sha256, json_safe, locked_directory,
                    read_results, write_manifest)
 from .tokens.attack import AttackConfig
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SYNTHETIC_KEYS = {"prompt", "token_ids", "observation_layer", "noise_seed",
-                  "self_cond_cfg_scale", "attention_mask"}
+SYNTHETIC_KEYS = {"observation_layer", "noise_seed", "self_cond_cfg_scale", "attention_mask"}
 
 
 @dataclass(frozen=True)
@@ -79,8 +70,8 @@ class PipelineConfig:
     solver: SolverConfig
     search: AttackConfig
     trials: int  # Stage B runs per Stage A result
-    synthetic_observation: dict | None
-    initialization: dict
+    synthetic_observation: dict  # how each dataset prompt's hidden state is generated
+    seed: int  # Stage B start seed of trial 0
     resolved: dict  # every setting, with the stage files inlined, for the manifest
 
 
@@ -88,9 +79,9 @@ def load_config(path):
     """Read a pipeline config; stage and model paths are relative to it."""
     path = Path(path).resolve()
     raw = yaml.safe_load(path.read_text())
-    required = {"model", "stage_a", "stage_b", "stage_b_initialization"}
-    if not required <= raw.keys() or raw.keys() - required - {"synthetic_observation"}:
-        raise ValueError(f"{path}: needs {sorted(required)}, optionally synthetic_observation")
+    required = {"model", "stage_a", "stage_b", "synthetic_observation", "stage_b_initialization"}
+    if raw.keys() != required:
+        raise ValueError(f"{path}: needs exactly {sorted(required)}")
     # Stage files list only what differs from the SolverConfig/AttackConfig defaults.
     stage_a = yaml.safe_load((path.parent / raw["stage_a"]).read_text()) or {}
     stage_b = yaml.safe_load((path.parent / raw["stage_b"]).read_text()) or {}
@@ -102,27 +93,24 @@ def load_config(path):
         raise ValueError("stage_b trials must be an integer >= 1")
     if search.mode != "projected":
         raise ValueError("Stage A recovers projected codes; Stage B must use mode: projected")
-    synthetic = raw.get("synthetic_observation")
-    if synthetic is not None:
-        if synthetic.keys() - SYNTHETIC_KEYS or "observation_layer" not in synthetic or \
-                ("prompt" in synthetic) == ("token_ids" in synthetic):
-            raise ValueError("synthetic_observation needs observation_layer and exactly one of "
-                             f"prompt or token_ids; allowed keys: {sorted(SYNTHETIC_KEYS)}")
+    # Prompts come only from the --dataset file, never from the config.
+    synthetic = raw["synthetic_observation"]
+    if not isinstance(synthetic, dict) or synthetic.keys() - SYNTHETIC_KEYS or "observation_layer" not in synthetic:
+        raise ValueError(f"synthetic_observation needs observation_layer; allowed keys: {sorted(SYNTHETIC_KEYS)} "
+                         "(prompts come from the --dataset file)")
     initialization = raw["stage_b_initialization"]
-    if not isinstance(initialization, dict) or len(initialization.keys() & {"seed", "tokens"}) != 1 \
-            or initialization.keys() - {"seed", "tokens"}:
-        raise ValueError("stage_b_initialization needs exactly one of seed or tokens")
-    if "tokens" in initialization and trials != 1:
-        raise ValueError("Explicit stage_b_initialization.tokens give identical trials; use seed")
+    if not isinstance(initialization, dict) or initialization.keys() != {"seed"} \
+            or isinstance(initialization["seed"], bool) or not isinstance(initialization["seed"], int):
+        raise ValueError("stage_b_initialization needs exactly an integer seed")
     # The manifest records every effective value, defaults included, not just the file contents.
     return PipelineConfig(path, (path.parent / raw["model"]).resolve(), solver, search, trials,
-                          synthetic, initialization,
+                          synthetic, initialization["seed"],
                           {**raw, "stage_a": asdict(solver), "stage_b": {**asdict(search), "trials": trials},
                            "stage_a_file": raw["stage_a"], "stage_b_file": raw["stage_b"]})
 
 
 def generation_options(synthetic):
-    """Keyword arguments of generate()/invert_prompt() from a synthetic_observation section."""
+    """Keyword arguments of invert_prompt() from a synthetic_observation section."""
     return {"observation_layer": synthetic["observation_layer"],
             "noise_seed": synthetic.get("noise_seed", 100),
             "self_cond_cfg_scale": synthetic.get("self_cond_cfg_scale", 1.0),
@@ -130,10 +118,9 @@ def generation_options(synthetic):
 
 
 def inversion_options(config, progress_interval):
-    """Keyword arguments of invert_observation()/invert_prompt() from a pipeline config."""
-    start = config.initialization
+    """Keyword arguments of invert_prompt() from a pipeline config."""
     return {"solver": config.solver, "search": replace(config.search, progress_interval_seconds=progress_interval),
-            "trials": config.trials, "seed": start.get("seed", 0), "start_tokens": start.get("tokens")}
+            "trials": config.trials, "seed": config.seed}
 
 
 def trial_records(result: InversionResult):
@@ -154,53 +141,33 @@ def package_versions():
     return {p: version(p) for p in ("jax", "jaxlib", "flax", "numpy", "elf-prompt-inversion")}
 
 
-def default_output(config_path):
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    return REPO_ROOT / "outputs" / "pipeline" / f"{Path(config_path).stem}-{stamp}"
-
-
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Run Stage A followed by Stage B on ELF hidden states.")
+    parser = argparse.ArgumentParser(
+        description="Invert every prompt of a dataset: ELF hidden state -> Stage A -> Stage B. "
+                    "For a single prompt, use elf_inversion.invert_prompt from Python.")
     parser.add_argument("--config", type=Path, required=True, help="Pipeline config, e.g. configs/pipeline/layer_3.yaml")
-    source = parser.add_mutually_exclusive_group()
-    source.add_argument("--observation", type=Path,
-                        help="Existing observation directory; default: generate one from the config's prompt")
-    source.add_argument("--prompt", help="Generate the hidden state from this text instead of the config's prompt")
-    source.add_argument("--dataset", type=Path,
-                        help="JSONL file of prompts (string id and text); needs --output, resumes there")
-    parser.add_argument("--output", type=Path, help="Results directory; default: outputs/pipeline/<config>-<time>")
+    parser.add_argument("--dataset", type=Path, required=True,
+                        help="JSONL file of prompts (string id and text, one or more rows)")
+    parser.add_argument("--output", type=Path, required=True,
+                        help="Results directory; rerunning the same command resumes there")
     parser.add_argument("--progress-interval", type=float, default=10.0,
                         help="Seconds between progress lines and heartbeats during long steps (default 10)")
     args = parser.parse_args(argv)
     if not args.progress_interval > 0:
         parser.error("--progress-interval must be positive")
+    if not args.dataset.is_file():
+        parser.error(f"Dataset not found: {args.dataset}")
     config = load_config(args.config)
-    if args.observation is None and config.synthetic_observation is None:
-        parser.error("The config has no synthetic_observation (observation layer and noise); pass --observation")
-    if args.dataset is not None:
-        if args.output is None:
-            parser.error("--dataset needs --output, so that rerunning the command resumes there")
-        if "tokens" in config.initialization:
-            parser.error("--dataset prompts differ in length; use stage_b_initialization.seed")
-        if not args.dataset.is_file():
-            parser.error(f"Dataset not found: {args.dataset}")
-    output = (args.output or default_output(config.path)).absolute()
-    if args.dataset is None and output.exists():
-        parser.error(f"Use a new output directory: {output}")
+    output = args.output.absolute()
 
     jax.config.update("jax_default_matmul_precision", "highest")
     device = start_jax_backend()
-    resumable = args.dataset is not None
-    output.mkdir(parents=True, exist_ok=resumable)
+    output.mkdir(parents=True, exist_ok=True)
     print(f"Results and progress log: {output}", flush=True)
-    # A resumable dataset directory is locked against a concurrent second runner.
-    lock = locked_directory(output) if resumable else nullcontext()
-    with lock, ProgressLogger(output / "progress.jsonl", args.progress_interval) as log:
+    # The resumable directory is locked against a concurrent second runner.
+    with locked_directory(output), ProgressLogger(output / "progress.jsonl", args.progress_interval) as log:
         log.report("device", f"JAX device: {device}", device=device)
-        if resumable:
-            run_dataset(config, args.dataset, output, log.report, args.progress_interval)
-        else:
-            run(config, args.observation, output, log.report, args.progress_interval, prompt=args.prompt)
+        run_dataset(config, args.dataset, output, log.report, args.progress_interval)
 
 
 def load_adapter(config, report):
@@ -208,91 +175,6 @@ def load_adapter(config, report):
     adapter = ELFAdapter.from_config(config.model, projected=True, local_files_only=True)
     report("model_loading_done", "Model loaded")
     return adapter
-
-
-def run(config, observation_dir, output, report, progress_interval=10.0, *, prompt=None):
-    """One pipeline run into the existing ``output`` directory; ``report`` logs progress.
-
-    ``prompt`` replaces the config's synthetic_observation prompt.
-    """
-    adapter = load_adapter(config, report)
-    if observation_dir is not None:
-        observation = load_observation(observation_dir)
-        source = str(Path(observation_dir).absolute())
-        report("observation_loaded", f"Loaded observation {source}")
-    else:
-        observation, adapter = generate_observation(config, adapter, prompt, output, report)
-        source = "observation/"
-    result = invert_observation(observation, adapter, **inversion_options(config, progress_interval), progress=report)
-    report_json = run_report(result, source)
-    write_run_files(output, result, report_json, run_manifest(config, adapter, observation, prompt))
-    print_run_summary(result, report_json["stage_b_trials"], output)
-
-
-def generate_observation(config, adapter, prompt, output, report):
-    """Hidden state for ``prompt`` (default: the config's), saved in <output>/observation/."""
-    synthetic = config.synthetic_observation
-    if prompt is not None:
-        tokens = prompt_tokens(adapter, prompt=prompt)
-    else:
-        tokens = prompt_tokens(adapter, synthetic.get("prompt"), synthetic.get("token_ids"))
-    options = generation_options(synthetic)
-    report("observation_start", f"Generating the hidden state after {options['observation_layer']} "
-           f"block(s) for {len(tokens)} prompt tokens")
-    observation, adapter = generate(adapter, tokens, **options)
-    save_observation(output / "observation", observation)
-    report("observation_done", "Hidden state generated and saved in observation/")
-    return observation, adapter
-
-
-def run_report(result: InversionResult, source):
-    """report.json: Stage A diagnostics (without arrays), every Stage B trial, the best one, scores."""
-    arrays = {"coordinates", "prompt_code", "noise_code", "stage_b_target"}
-    report_json = {"observation": source, "metadata": asdict(result.observation.metadata),
-                   **{k: v for k, v in asdict(result.stage_a).items() if k not in arrays}}
-    report_json["stage_b_trials"] = trial_records(result)
-    report_json["stage_b"] = None if result.best is None else report_json["stage_b_trials"][result.best]
-    if result.evaluation is not None:
-        report_json["synthetic_evaluation"] = result.evaluation
-    return report_json
-
-
-def run_manifest(config, adapter, observation, prompt):
-    return {
-        "config_path": config.path, "configuration": config.resolved,
-        **({"prompt_override": prompt} if prompt is not None else {}),
-        "model_provenance": adapter.provenance,
-        "model_settings_sha256": hashlib.sha256(config.model.read_bytes()).hexdigest(),
-        "observation_sha256": hashlib.sha256(np.asarray(observation.hidden_state).tobytes()).hexdigest(),
-        "source_sha256": source_hashes(),
-        "packages": package_versions(),
-        "devices": [str(d) for d in jax.devices()], "precision": "float32/highest",
-        "claim": "Forward reconstruction does not establish unique latent or token recovery"}
-
-
-def write_run_files(output, result: InversionResult, report_json, manifest):
-    recovered = result.stage_a
-    np.savez(output / "recovery.npz", observation=np.asarray(result.observation.hidden_state),
-             coordinates=np.asarray(recovered.coordinates), prompt_code=np.asarray(recovered.prompt_code),
-             noise_code=np.asarray(recovered.noise_code), stage_b_target=np.asarray(recovered.stage_b_target))
-    for filename, value in (("report.json", report_json), ("manifest.json", manifest)):
-        (output / filename).write_text(json.dumps(json_safe(value), indent=2, allow_nan=False) + "\n")
-
-
-def print_run_summary(result: InversionResult, trials, output):
-    recovered = result.stage_a
-    print(f"Stage A: converged={recovered.converged} ({recovered.stop_reason}), "
-          f"residual={recovered.absolute_residual:.6g}, relative={recovered.relative_residual:.6g}", flush=True)
-    for trial in trials:
-        marker = " (best)" if trial["trial"] == result.best else ""
-        print(f"Stage B trial {trial['trial']}: {trial['text']!r}, loss={trial['final_loss']:.6g} "
-              f"({trial['stop_reason']}){marker}", flush=True)
-    if result.evaluation is not None:
-        scores = result.evaluation
-        print(f"Truth:   {scores['true_text']!r}, best-trial token accuracy={scores['stage_b_token_accuracy']:.3g}, "
-              f"exact recovery rate={scores['stage_b_exact_recovery_rate']:.3g} over {len(result.stage_b)} trial(s), "
-              f"prompt code error={scores['prompt_code_error']:.3g}", flush=True)
-    print(f"Saved {output}", flush=True)
 
 
 def read_dataset(path):
