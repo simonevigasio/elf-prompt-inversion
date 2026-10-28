@@ -27,3 +27,6 @@ checkpoint_*/
 .
 # vscode debugging
 .vscode/
+
+# Vim swap files
+*.swp
