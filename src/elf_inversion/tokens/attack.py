@@ -37,7 +37,7 @@ class AttackConfig:
     restarts: int = 1
     seed: int = 200
     # Skip the remaining restarts once one reaches stopping_loss_tolerance.
-    stop_restarts_at_tolerance: bool = True
+    stop_restarts_at_tolerance: bool = False
 
     def __post_init__(self):
         if (type(self.progress_interval_seconds) not in (int, float) or
