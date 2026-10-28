@@ -26,6 +26,9 @@ found.tokens, found.final_loss, found.selected_restart, found.restarts
 `attack` runs one search from given tokens. `search` is Stage B's counterpart of
 Stage A's restarts: `restarts` attacks from random non-special tokens with seeds
 `seed + restart` (both in `AttackConfig`), selecting the lowest final loss.
+With `stop_restarts_at_tolerance` (default `true`), the first restart whose loss
+reaches `stopping_loss_tolerance` ends the search and the remaining restarts are
+skipped; `found.restarts` then holds only the restarts that ran.
 
 The attack receives only the target, the initial tokens and the model
 (`elf_inversion.model.adapter.ELFAdapter`); no ground truth. Search

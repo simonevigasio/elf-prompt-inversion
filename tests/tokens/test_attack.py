@@ -194,7 +194,7 @@ class AttackTests(unittest.TestCase):
                        {"max_candidate_evaluations": 1.5}, {"mode": "invalid"},
                        {"acceptance_atol": float("nan")}, {"stopping_loss_tolerance": -1},
                        {"progress_interval_seconds": 0}, {"progress_interval_seconds": float("inf")},
-                       {"restarts": 0}, {"restarts": True}, {"seed": -1}):
+                       {"restarts": 0}, {"restarts": True}, {"seed": -1}, {"stop_restarts_at_tolerance": 1}):
             with self.assertRaises(ValueError):
                 AttackConfig(**kwargs)
         model = TinyModel()

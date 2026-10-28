@@ -3,8 +3,9 @@
 The Stage B counterpart of Stage A's ``recover``: ``AttackConfig.restarts``
 attacks start from random non-special tokens drawn with seeds
 ``config.seed + restart``, and the lowest final loss wins (ties keep the
-earliest restart). Accepts only the target, the model and the configuration;
-no ground truth.
+earliest restart). With ``config.stop_restarts_at_tolerance`` (the default),
+the first restart whose loss reaches ``config.stopping_loss_tolerance`` ends the
+search. Accepts only the target, the model and the configuration; no ground truth.
 """
 from dataclasses import dataclass
 
@@ -16,9 +17,9 @@ from .data import allowed_vocabulary
 
 @dataclass(frozen=True)
 class SearchResult:
-    restarts: tuple[AttackResult, ...]      # one per restart, in order
-    initial_tokens: tuple[np.ndarray, ...]  # start of each restart
-    seeds: tuple[int | None, ...]           # start seed of each restart; None for explicit tokens
+    restarts: tuple[AttackResult, ...]      # one per restart run, in order (fewer after an early stop)
+    initial_tokens: tuple[np.ndarray, ...]  # start of each restart run
+    seeds: tuple[int | None, ...]           # start seed of each restart run; None for explicit tokens
     selected_restart: int                   # lowest final loss
 
     @property
@@ -68,5 +69,12 @@ def search(target_codes, model, config: AttackConfig = AttackConfig(), *, start_
                              seed=seeds[restart])
         results.append(attack(target_codes, initial, model, config,
                               progress=restart_progress if progress is not None else None))
+        skipped = len(initials) - len(results)
+        if config.stop_restarts_at_tolerance and skipped and results[-1].final_loss <= config.stopping_loss_tolerance:
+            if progress is not None:
+                restart_progress("stage_b_early_stop", f"loss {results[-1].final_loss:.8g} <= tolerance "
+                                 f"{config.stopping_loss_tolerance:.3g}; skipping {skipped} remaining restart(s)",
+                                 loss=results[-1].final_loss, skipped_restarts=skipped)
+            break
     selected = min(range(len(results)), key=lambda i: (results[i].final_loss, i))
-    return SearchResult(tuple(results), initials, seeds, selected)
+    return SearchResult(tuple(results), initials[:len(results)], seeds[:len(results)], selected)

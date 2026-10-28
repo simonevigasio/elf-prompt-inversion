@@ -36,6 +36,8 @@ class AttackConfig:
     # Used by tokens.search.search: one attack per restart, random start seed + restart.
     restarts: int = 1
     seed: int = 200
+    # Skip the remaining restarts once one reaches stopping_loss_tolerance.
+    stop_restarts_at_tolerance: bool = True
 
     def __post_init__(self):
         if (type(self.progress_interval_seconds) not in (int, float) or
@@ -48,6 +50,8 @@ class AttackConfig:
             minimum = 1 if name in ("k", "candidate_batch_size", "restarts") else 0
             if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < minimum:
                 raise ValueError(f"{name} must be an integer >= {minimum}")
+        if type(self.stop_restarts_at_tolerance) is not bool:
+            raise ValueError("stop_restarts_at_tolerance must be true or false")
         for name in ("stopping_loss_tolerance", "acceptance_atol", "acceptance_rtol"):
             if not np.isfinite(getattr(self, name)) or getattr(self, name) < 0:
                 raise ValueError(f"{name} must be finite and nonnegative")

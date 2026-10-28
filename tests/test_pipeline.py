@@ -90,6 +90,17 @@ class StageIntegrationTests(unittest.TestCase):
         self.assertEqual([r["restart"] for r in scores], [0, 1, 2])
         self.assertEqual(result.evaluation["stage_b_exact_recovery_rate"], np.mean([r["exact_tokens"] for r in scores]))
 
+    def test_stage_b_skips_restarts_after_reaching_tolerance(self):
+        config = dict(k=9, max_iterations=2, restarts=3, seed=7, stopping_loss_tolerance=1e30)
+        result = invert_prompt([4], self.adapter, observation_layer=0, solver=SolverConfig(restarts=1),
+                               search=AttackConfig(**config))
+        self.assertEqual(len(result.stage_b.restarts), 1)
+        self.assertEqual(result.stage_b.seeds, (7,))
+        self.assertEqual(len(result.evaluation["stage_b_restarts"]), 1)
+        result = invert_prompt([4], self.adapter, observation_layer=0, solver=SolverConfig(restarts=1),
+                               search=AttackConfig(**config, stop_restarts_at_tolerance=False))
+        self.assertEqual(len(result.stage_b.restarts), 3)
+
     def test_encoder_mode_is_rejected(self):
         metadata = ForwardMetadata(1, 0)
         truth = observe(self.adapter, [4], metadata)
