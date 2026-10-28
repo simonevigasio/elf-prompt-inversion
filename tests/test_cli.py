@@ -10,8 +10,10 @@ import yaml
 
 from elf_inversion.backbone.recovery import recover
 from elf_inversion.backbone.solver import SolverConfig
-from elf_inversion.cli import load_config, main, repetition_seeds
+from elf_inversion.cli import (FORWARD_MISMATCH, NOISE_ATTEMPTS, load_config, main, repetition_seeds,
+                               retry_noise_seed)
 from elf_inversion.model.testing import tiny_native_adapter
+from elf_inversion.observation import ForwardMismatch
 from elf_inversion.pipeline import invert_prompt
 from elf_inversion.tokens.attack import AttackConfig
 
@@ -148,6 +150,39 @@ class PipelineCommandTests(unittest.TestCase):
             for repetitions in (0, True, 1.5):
                 with self.subTest(repetitions=repetitions), self.assertRaises(ValueError):
                     load_config(self.write_config(root, repetitions=repetitions))
+
+    def test_forward_mismatch_retries_noise_then_skips(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.write_config(root)
+            dataset = self.write_dataset(root, {"id": "a", "text": "4"}, {"id": "b", "text": "5"},
+                                         {"id": "c", "text": "6"})
+            output = root / "mismatch"
+            loaded = load_config(config)
+            # "a" fails its first noise seed only, "b" fails every seed, "c" never fails.
+            failing = {repetition_seeds(loaded, "a", 0)["noise"]} | {
+                retry_noise_seed(loaded, "b", 0, attempt) if attempt else repetition_seeds(loaded, "b", 0)["noise"]
+                for attempt in range(NOISE_ATTEMPTS)}
+
+            def invert(*args, noise_seed, **kwargs):
+                if noise_seed in failing:
+                    raise ForwardMismatch("mismatch", noise_seed, 0.5)
+                return invert_prompt(*args, noise_seed=noise_seed, **kwargs)
+
+            with patch("elf_inversion.model.adapter.ELFAdapter.from_config", return_value=text_adapter()), \
+                    patch("elf_inversion.cli.invert_prompt", side_effect=invert):
+                main(["--config", str(config), "--dataset", str(dataset), "--output", str(output)])
+            rows = {r["example_id"]: r for r in map(json.loads, (output / "results.jsonl").read_text().splitlines())}
+            self.assertEqual({k: r["status"] for k, r in rows.items()}, {"a": "done", "b": "skipped", "c": "done"})
+            self.assertEqual(rows["a"]["seeds"]["noise"], retry_noise_seed(loaded, "a", 0, 1))
+            self.assertEqual([r["noise_seed"] for r in rows["a"]["rejected_noise_seeds"]],
+                             [repetition_seeds(loaded, "a", 0)["noise"]])
+            self.assertEqual(len(rows["b"]["rejected_noise_seeds"]), NOISE_ATTEMPTS)
+            self.assertEqual(rows["b"]["reason"], FORWARD_MISMATCH)
+            self.assertEqual(rows["c"]["rejected_noise_seeds"], [])
+            summary = json.loads((output / "summary.json").read_text())
+            self.assertEqual((summary["completed"], summary["skipped"], summary["forward_mismatches"]),
+                             (2, 1, 1 + NOISE_ATTEMPTS))
 
     def test_repository_configs_load(self):
         # PyYAML reads e.g. 1.0e12 (no exponent sign) as a string; catch such typos here.

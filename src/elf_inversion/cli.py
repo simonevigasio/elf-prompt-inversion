@@ -57,7 +57,7 @@ import elf_inversion
 
 from .backbone.solver import SolverConfig
 from .model.adapter import ELFAdapter
-from .observation import prompt_tokens
+from .observation import ForwardMismatch, prompt_tokens
 from .pipeline import InversionResult, invert_prompt
 from .progress import ProgressLogger
 from .runs import (append_result, canonical, digest, file_sha256, json_safe, locked_directory,
@@ -67,6 +67,9 @@ from .tokens.attack import AttackConfig
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SYNTHETIC_KEYS = {"observation_layer", "noise_seed", "self_cond_cfg_scale", "attention_mask"}
 RESULT_KEY = ("example_id", "repetition")
+# Noise seeds tried per (prompt, repetition) before it is skipped for a Stage A forward mismatch.
+NOISE_ATTEMPTS = 3
+FORWARD_MISMATCH = "Stage A forward does not reproduce the native observation"
 
 
 @dataclass(frozen=True)
@@ -137,6 +140,11 @@ def repetition_seeds(config, example_id, repetition):
     return {"noise": derived_seed("noise", config.synthetic_observation.get("noise_seed", 100), example_id, repetition),
             "stage_a": derived_seed("stage_a", config.solver.seed, example_id, repetition),
             "stage_b": derived_seed("stage_b", config.search.seed, example_id, repetition)}
+
+
+def retry_noise_seed(config, example_id, repetition, attempt):
+    """Noise seed of the ``attempt``-th retry (1, 2, ...) after a Stage A forward mismatch."""
+    return derived_seed("noise", config.synthetic_observation.get("noise_seed", 100), example_id, repetition, attempt)
 
 
 def repetition_options(options, seeds):
@@ -264,6 +272,8 @@ def summarize_dataset(rows, total, repetitions):
             "exact_recovery_rate": mean([r["exact_recovery"] for r in done]),
             "mean_token_accuracy": mean([r["token_accuracy"] for r in done]),
             "stage_a_convergence_rate": mean([r["stage_a"]["converged"] for r in done]),
+            # Every noise seed rejected by the forward check, in completed and skipped runs.
+            "forward_mismatches": sum(len(r.get("rejected_noise_seeds", ())) for r in rows),
             "mean_runtime_seconds": mean([r["runtime_seconds"] for r in done])}
 
 
@@ -333,11 +343,32 @@ def run_dataset(config, dataset_path, output, report, progress_interval=10.0):
                    "text": example["text"], "reason": str(error)}
             prompt_progress("prompt_skipped", f"skipped: {error}")
         else:
-            result = invert_prompt(tokens, adapter, **repetition_options(options, seeds), progress=prompt_progress)
-            row = dataset_row(example, repetition, seeds, result, perf_counter() - start)
-            prompt_progress("prompt_done", f"{row['recovered_text']!r}, token accuracy {row['token_accuracy']:.3g}, "
-                            f"exact={row['exact_recovery']}", token_accuracy=row["token_accuracy"],
-                            exact_recovery=row["exact_recovery"], seconds=row["runtime_seconds"])
+            # A forward mismatch is found before Stage A starts, so retrying with new noise is cheap.
+            rejected, result = [], None
+            for attempt in range(NOISE_ATTEMPTS):
+                if attempt:
+                    seeds = {**seeds, "noise": retry_noise_seed(config, example["id"], repetition, attempt)}
+                try:
+                    result = invert_prompt(tokens, adapter, **repetition_options(options, seeds),
+                                           progress=prompt_progress)
+                    break
+                except ForwardMismatch as mismatch:
+                    rejected.append({"noise_seed": mismatch.noise_seed,
+                                     "maximum_absolute_error": mismatch.maximum_absolute_error})
+                    action = "retrying with a new noise seed" if attempt + 1 < NOISE_ATTEMPTS else "skipping"
+                    prompt_progress("observation_rejected", f"{FORWARD_MISMATCH} with noise seed "
+                                    f"{mismatch.noise_seed} (max error {mismatch.maximum_absolute_error:.3g}); "
+                                    f"{action}", **rejected[-1])
+            if result is None:
+                row = {"example_id": example["id"], "repetition": repetition, "status": "skipped",
+                       "text": example["text"], "reason": FORWARD_MISMATCH, "rejected_noise_seeds": rejected}
+                prompt_progress("prompt_skipped", f"skipped: {FORWARD_MISMATCH} for {NOISE_ATTEMPTS} noise seeds")
+            else:
+                row = {**dataset_row(example, repetition, seeds, result, perf_counter() - start),
+                       "rejected_noise_seeds": rejected}
+                prompt_progress("prompt_done", f"{row['recovered_text']!r}, token accuracy {row['token_accuracy']:.3g}, "
+                                f"exact={row['exact_recovery']}", token_accuracy=row["token_accuracy"],
+                                exact_recovery=row["exact_recovery"], seconds=row["runtime_seconds"])
         row = json_safe(row)
         append_result(results_path, row)
         rows.append(row)

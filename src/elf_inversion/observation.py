@@ -43,6 +43,14 @@ class Observation:
     generator: dict | None = None  # how a synthetic observation was produced
 
 
+class ForwardMismatch(AssertionError):
+    """Stage A's forward map does not reproduce the native observation of one noise seed."""
+
+    def __init__(self, message, noise_seed, maximum_absolute_error):
+        super().__init__(message)
+        self.noise_seed, self.maximum_absolute_error = noise_seed, maximum_absolute_error
+
+
 def prompt_tokens(adapter, prompt=None, token_ids=None):
     """Token IDs for exactly one of a text prompt or explicit IDs; no special tokens."""
     if (prompt is None) == (token_ids is None):
@@ -115,8 +123,14 @@ def generate(adapter, tokens, *, observation_layer, noise_seed=100, self_cond_cf
     forward = BackboneForward(adapter, metadata)
     reconstructed = jax.jit(forward)(forward.coordinates(truth.prompt_code, truth.noise_code))
     difference = np.asarray(reconstructed) - np.asarray(truth.observation)
-    np.testing.assert_allclose(reconstructed, truth.observation, atol=1e-4, rtol=1e-4,
-                               err_msg="Stage A forward does not reproduce the native observation")
+    # atol scales with the tensor: float32 reordering under jit loses ~1e-5 of the magnitude,
+    # which a per-element tolerance flags on values that cancel to near zero.
+    scale = float(np.max(np.abs(truth.observation)))
+    try:
+        np.testing.assert_allclose(reconstructed, truth.observation, atol=1e-5 * scale, rtol=1e-4,
+                                   err_msg="Stage A forward does not reproduce the native observation")
+    except AssertionError as error:
+        raise ForwardMismatch(str(error), noise_seed, float(np.max(np.abs(difference)))) from None
     generator = {"noise_seed": noise_seed, "forward_equivalence": {
         "absolute_residual": float(np.linalg.norm(difference)),
         "maximum_absolute_error": float(np.max(np.abs(difference)))}}
