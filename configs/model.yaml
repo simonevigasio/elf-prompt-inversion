@@ -23,4 +23,6 @@ denoiser:
 prompt_length: 8
 # Synthetic non-conditioning suffix: exactly one valid EOS, then EOS padding.
 filler_token_ids: [1]
-local_files_only: true
+# true: cache only (fails if missing); false: always check the Hub; auto: cache first,
+# download pinned revisions only when missing.
+local_files_only: auto

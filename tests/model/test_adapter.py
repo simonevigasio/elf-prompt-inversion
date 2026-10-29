@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from elf_inversion.model.adapter import ELFAdapter, native_modules, read_settings
+from elf_inversion.model.adapter import ELFAdapter, _from_hub, native_modules, read_settings
 
 
 class TinyTokenizer:
@@ -157,6 +157,31 @@ class CheckpointEquivalence(EquivalenceChecks, unittest.TestCase):
         self.assertEqual(a.pad_token_id, 1)
         with self.assertRaises(ValueError):
             a.tokenize("short")
+
+
+class HubLoadingModes(unittest.TestCase):
+    def test_auto_reads_cache_first_and_downloads_only_on_a_miss(self):
+        calls = []
+
+        def cached(local):
+            calls.append(local)
+            return "cache"
+        self.assertEqual(_from_hub(cached, "auto"), "cache")
+        self.assertEqual(calls, [True])
+
+        calls.clear()
+
+        def missing(local):
+            calls.append(local)
+            if local:
+                raise FileNotFoundError("not cached")
+            return "hub"
+        self.assertEqual(_from_hub(missing, "auto"), "hub")
+        self.assertEqual(calls, [True, False])
+        with self.assertRaises(FileNotFoundError):
+            _from_hub(missing, True)
+        with self.assertRaises(ValueError):
+            _from_hub(missing, "yes")
 
 
 if __name__ == "__main__":

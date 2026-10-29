@@ -209,8 +209,8 @@ def main(argv=None):
 
 
 def load_adapter(config, report):
-    report("model_loading_start", "Loading pinned ELF weights offline")
-    adapter = ELFAdapter.from_config(config.model, projected=True, local_files_only=True)
+    report("model_loading_start", "Loading pinned ELF weights (local_files_only from the model settings)")
+    adapter = ELFAdapter.from_config(config.model, projected=True)
     report("model_loading_done", "Model loaded")
     return adapter
 

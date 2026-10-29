@@ -57,9 +57,12 @@ python3 -m venv .venv
 
 Skip the `torch` line and `test` if you do not run the tests.
 
-Experiments load weights offline. Fetch the pinned artifacts once (the De–En
-denoiser checkpoint is large; `denoiser.cache_dir` in `configs/model.yaml`
-defaults to the temporary `/tmp/stage-b-hf`):
+Experiments read the pinned weights from the local cache and download them only
+when missing (`local_files_only: auto` in `configs/model.yaml`; `true` forbids
+downloads, `false` always checks the Hub). The De–En denoiser checkpoint is
+large; `denoiser.cache_dir` defaults to the temporary `/tmp/stage-b-hf`, so
+choose a persistent path to avoid downloading it again after a reboot. To fetch
+everything in advance:
 
 ```bash
 JAX_PLATFORMS=cpu .venv/bin/python -c \

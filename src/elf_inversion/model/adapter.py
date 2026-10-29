@@ -115,6 +115,21 @@ def _native_config(native, config_path: Path):
     return config
 
 
+def _from_hub(load, offline):
+    """``load(local_files_only)`` for True/False; "auto" reads the cache and downloads only on a miss.
+
+    Downloads are still pinned to the configured revisions.
+    """
+    if offline not in (True, False, "auto"):
+        raise ValueError('local_files_only must be true, false or "auto"')
+    if offline != "auto":
+        return load(offline)
+    try:
+        return load(True)
+    except OSError:  # huggingface_hub's LocalEntryNotFoundError and transformers' missing files
+        return load(False)
+
+
 def _load_denoiser_params(native, config, spec, offline):
     """EMA parameters of the released denoiser, checked against the source config.
 
@@ -122,11 +137,11 @@ def _load_denoiser_params(native, config, spec, offline):
     """
     from huggingface_hub import snapshot_download
 
-    snapshot = Path(snapshot_download(
+    snapshot = Path(_from_hub(lambda local: snapshot_download(
         repo_id=spec["repo"], revision=spec["revision"],
-        cache_dir=os.path.expanduser(spec["cache_dir"]), local_files_only=offline,
+        cache_dir=os.path.expanduser(spec["cache_dir"]), local_files_only=local,
         allow_patterns=[spec["checkpoint"] + "/**", spec["config"]],
-    ))
+    ), offline))
     with open(snapshot / spec["config"]) as f:
         release_config = yaml.safe_load(f)
     for key in RELEASE_CONFIG_FIELDS:
@@ -210,11 +225,12 @@ class ELFAdapter:
         if f'{enc_spec["repo"]}/{enc_spec["filename"]}' != config.encoder_checkpoint:
             raise ValueError("Encoder checkpoint differs from ELF configuration")
 
-        tokenizer = AutoTokenizer.from_pretrained(
-            tok_spec["repo"], revision=tok_spec["revision"], local_files_only=offline,
-        )
-        enc_path = hf_hub_download(repo_id=enc_spec["repo"], revision=enc_spec["revision"],
-                                   filename=enc_spec["filename"], local_files_only=offline)
+        tokenizer = _from_hub(lambda local: AutoTokenizer.from_pretrained(
+            tok_spec["repo"], revision=tok_spec["revision"], local_files_only=local,
+        ), offline)
+        enc_path = _from_hub(lambda local: hf_hub_download(
+            repo_id=enc_spec["repo"], revision=enc_spec["revision"],
+            filename=enc_spec["filename"], local_files_only=local), offline)
         ec, encoder, _ = native["t5"].get_encoder(config.encoder_model_name, jnp.float32)
         enc_params = native["checkpoint"].load_encoder_checkpoint(enc_path)
         provenance = {"elf_commit": settings["elf_commit"], "tokenizer": tok_spec,
