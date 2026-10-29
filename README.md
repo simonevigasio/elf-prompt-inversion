@@ -176,7 +176,11 @@ restart `r` starting from random non-special tokens drawn with seed `seed + r`
 (default seed 200), and keeps the lowest final loss. Neither choice uses the truth.
 
 The hidden state comes from ELF's native sampler (first sampling pass, time 0,
-noise seed `noise_seed`). Layer `k` is the state after `k` complete backbone
+noise seed `noise_seed`). With `time: t` (and optionally `sampling_steps: N`,
+default 64), it is the call at time `t` instead: ELF's own Euler ODE steps run
+from 0 to `t` on the uniform `N`-step schedule (conditional calls, no external
+CFG), so `t` must be `k / N` with `k < N`. Stage A is told `t`, but not the
+trajectory; `configs/pipeline/layer_3_time_0.5.yaml` is an example. Layer `k` is the state after `k` complete backbone
 blocks; layer 0 is the state entering `blocks_0`. Before it is used, Stage A's
 forward map must reproduce it from the true codes. Stage A sees only the hidden
 state and its metadata; Stage B starts from random tokens, never from the truth.

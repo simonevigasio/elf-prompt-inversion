@@ -8,7 +8,7 @@ import numpy as np
 
 from elf_inversion.backbone.forward import BackboneForward, ForwardMetadata
 from elf_inversion.model.testing import tiny_native_adapter
-from elf_inversion.observation import observe
+from elf_inversion.observation import generate, observe
 
 
 class ForwardTests(unittest.TestCase):
@@ -29,6 +29,42 @@ class ForwardTests(unittest.TestCase):
                     np.testing.assert_allclose(f.codes(coordinates)[0], target, atol=2e-6)
                     self.assertGreater(float(jnp.linalg.norm(f.bias)), 0)
 
+    def test_later_sampling_pass_forward_equivalence(self):
+        # Two Euler steps of a 4-step schedule, then the observed call at t = 0.5.
+        for layer in (0, 1, 2):
+            for mask in (None, (1, 1, 0, 0)):
+                with self.subTest(layer=layer, mask=mask):
+                    metadata = ForwardMetadata(1, layer, time=0.5, self_cond_cfg_scale=1.5, attention_mask=mask,
+                                               forward_mode="sampling_pass")
+                    f = BackboneForward(self.adapter, metadata)
+                    truth = observe(self.adapter, [4], metadata, sampling_steps=4)
+                    coordinates = f.coordinates(truth.prompt_code, truth.noise_code)
+                    np.testing.assert_allclose(f.codes(coordinates)[1], truth.noise_code, atol=2e-6)
+                    np.testing.assert_allclose(jax.jit(f)(coordinates), truth.observation, atol=3e-5, rtol=3e-5)
+                    target = self.adapter.encode_token_ids(self.adapter.prepare_token_ids([4]), "projected")
+                    np.testing.assert_allclose(f.codes(coordinates)[0], target, atol=2e-6)
+
+    def test_later_sampling_pass_differs_from_first_pass(self):
+        first = observe(self.adapter, [4], ForwardMetadata(1, 1))
+        later = observe(self.adapter, [4], ForwardMetadata(1, 1, time=0.5, forward_mode="sampling_pass"),
+                        sampling_steps=4)
+        np.testing.assert_allclose(later.prompt_code, first.prompt_code, atol=2e-6)
+        self.assertFalse(np.allclose(later.noise_code, first.noise_code, atol=1e-3))
+        f = BackboneForward(self.adapter, ForwardMetadata(1, 1, time=0.5, forward_mode="sampling_pass"))
+        self.assertEqual(f.noise_map.shape[0], 2 * self.adapter.model.text_encoder_dim)
+
+    def test_generate_later_sampling_pass(self):
+        observation, _ = generate(self.adapter, [4], observation_layer=1, time=0.75, sampling_steps=4)
+        self.assertEqual(observation.metadata.forward_mode, "sampling_pass")
+        self.assertEqual(observation.metadata.time, 0.75)
+        self.assertEqual(observation.generator["sampling_steps"], 4)
+        first, _ = generate(self.adapter, [4], observation_layer=1)
+        self.assertEqual(first.metadata.forward_mode, "first_sampling_pass")
+        self.assertNotIn("sampling_steps", first.generator)
+        for time in (0.3, 1.0):  # off the 4-step grid; the final time is never a call
+            with self.subTest(time=time), self.assertRaises(ValueError):
+                generate(self.adapter, [4], observation_layer=1, time=time, sampling_steps=4)
+
     def test_jvp_vjp_adjoint_and_finite_difference(self):
         f = BackboneForward(self.adapter, ForwardMetadata(1, 1))
         x = f.initialize(8)
@@ -41,18 +77,22 @@ class ForwardTests(unittest.TestCase):
         np.testing.assert_allclose(jv, finite_difference, atol=2e-3, rtol=2e-3)
 
     def test_algebraic_code_recovery(self):
-        m = ForwardMetadata(1, 0)
-        f = BackboneForward(self.adapter, m)
-        truth = observe(self.adapter, [4], m)
-        recovered = f.algebraic(truth.observation)
-        self.assertIsNotNone(recovered)
-        p, g = f.codes(recovered)
-        np.testing.assert_allclose(p, truth.prompt_code, atol=3e-6)
-        np.testing.assert_allclose(g, truth.noise_code, atol=3e-6)
+        for m in (ForwardMetadata(1, 0), ForwardMetadata(1, 0, time=0.5, forward_mode="sampling_pass")):
+            with self.subTest(forward_mode=m.forward_mode):
+                f = BackboneForward(self.adapter, m)
+                truth = observe(self.adapter, [4], m, sampling_steps=4)
+                recovered = f.algebraic(truth.observation)
+                self.assertIsNotNone(recovered)
+                p, g = f.codes(recovered)
+                np.testing.assert_allclose(p, truth.prompt_code, atol=3e-6)
+                np.testing.assert_allclose(g, truth.noise_code, atol=3e-6)
 
     def test_unsupported_metadata(self):
         for kwargs in ({"time": .5}, {"observation_layer": 3}, {"attention_mask": (1, 0)},
-                       {"forward_mode": "later_sampling_pass"}):
+                       {"forward_mode": "later_sampling_pass"},
+                       {"time": 1.0, "forward_mode": "sampling_pass"},
+                       {"time": -0.25, "forward_mode": "sampling_pass"},
+                       {"time": float("nan"), "forward_mode": "sampling_pass"}):
             with self.assertRaises(ValueError):
                 BackboneForward(self.adapter, ForwardMetadata(1, **kwargs))
 

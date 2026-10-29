@@ -21,7 +21,7 @@ from .backbone.solver import SolverConfig
 from .tokens.attack import AttackConfig
 from .tokens.search import SearchResult, search as search_tokens
 
-from .observation import Observation, generate, prompt_tokens
+from .observation import SAMPLING_STEPS, Observation, generate, prompt_tokens
 
 
 @dataclass(frozen=True)
@@ -118,12 +118,13 @@ def invert_observation(observation: Observation, adapter, *, solver=SolverConfig
 
 
 def invert_prompt(prompt, adapter, *, observation_layer, noise_seed=100, self_cond_cfg_scale=1.0,
-                  attention_mask=None, solver=SolverConfig(), search=None, start_tokens=None,
-                  progress=None) -> InversionResult:
+                  attention_mask=None, time=0.0, sampling_steps=SAMPLING_STEPS, solver=SolverConfig(),
+                  search=None, start_tokens=None, progress=None) -> InversionResult:
     """Generate ELF's hidden state for ``prompt`` (text or token IDs), then invert it.
 
     The prompt is only used to create the hidden state and, afterwards, to fill
     ``result.evaluation``; recovery itself sees the hidden state and metadata only.
+    ``time`` > 0 observes a later sampler call (see ``generate``); Stage A knows the time.
     """
     report = progress or (lambda *args, **kwargs: None)
     tokens = (prompt_tokens(adapter, prompt=prompt) if isinstance(prompt, str)
@@ -131,7 +132,8 @@ def invert_prompt(prompt, adapter, *, observation_layer, noise_seed=100, self_co
     report("observation_start", f"Generating the hidden state after {observation_layer} block(s) "
            f"for {len(tokens)} prompt tokens")
     observation, adapter = generate(adapter, tokens, observation_layer=observation_layer, noise_seed=noise_seed,
-                                    self_cond_cfg_scale=self_cond_cfg_scale, attention_mask=attention_mask)
+                                    self_cond_cfg_scale=self_cond_cfg_scale, attention_mask=attention_mask,
+                                    time=time, sampling_steps=sampling_steps)
     report("observation_done", "Hidden state generated")
     return invert_observation(observation, adapter, solver=solver, search=search, start_tokens=start_tokens,
                               progress=progress)

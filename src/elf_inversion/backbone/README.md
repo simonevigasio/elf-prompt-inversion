@@ -33,12 +33,14 @@ that differ from the `SolverConfig` defaults (currently none).
 
 ## Scope
 
-Only the **first sampling pass** of the pinned ELF model is supported: time zero,
-no previous prediction, self-conditioning scale tokens enabled, deterministic
-evaluation, and the conditional backbone call. Later sampling passes, unknown
-previous predictions, decoding mode, training/dropout, mixed CFG outputs,
-partial hidden-state observations, and encoder-mode Stage B targets are
-unsupported and must not be interpreted as this inverse problem.
+One conditional backbone call of the pinned ELF sampler at a **known time** is
+supported, with self-conditioning scale tokens enabled and deterministic
+evaluation. `forward_mode: first_sampling_pass` is the first call (time zero, no
+previous prediction); `forward_mode: sampling_pass` is any call at time
+`0 <= t < 1`, whose generation inputs (the state `z_t` and the previous
+prediction) are unknown. Unknown time, decoding mode, training/dropout, mixed
+CFG outputs, partial hidden-state observations, and encoder-mode Stage B targets
+are unsupported and must not be interpreted as this inverse problem.
 
 ## Verified interface
 
@@ -66,6 +68,12 @@ Q = concatenate(zeta_p, zeta_g, sequence_axis)
 X_text = Q W2 + b2
 ```
 
+At a later call (`sampling_pass`), `restore_cond` keeps the prompt positions at
+`[C,C]`, so `zeta_p` is unchanged, while generation positions carry `[z_t, x_prev]`:
+`zeta_g = [z_t, x_prev] [Wz; Ws] W1 + c`. Stage A then uses the row space of
+`[Wz; Ws] W1` in place of `A`; it contains `A`'s and, when `A` already spans the
+bottleneck, equals it.
+
 `W2,b2` are `text_proj.proj2`. Prompt and noise occupy different **sequence
 positions**; current-state and self-conditioning channels concatenate in the
 **feature dimension** before projection. No normalization or activation occurs
@@ -91,15 +99,15 @@ these native modules and stops at the requested layer.
 ## Known and unknown inputs
 
 Known: the frozen weights/configuration; exact prompt length and contiguous
-prefix placement; observation layer; time (zero); self-conditioning scale;
-optional text attention mask; first-pass zero previous prediction; inactive
-decoding mode; and the observed full hidden-state tensor. The model supplies
+prefix placement; observation layer; time and forward mode; self-conditioning
+scale; optional text attention mask; inactive decoding mode; and the observed full hidden-state tensor. The model supplies
 sequence length, normalization, RoPE convention, noise scale, and prefix lengths.
 External classifier-free guidance mixes *outputs of separate calls*, not an
 internal hidden state; only a conditional call is supported.
 
 Unknown: prompt and generation bottleneck codes. No prompt tokens, encoder
-states, random noise, or generator seed enter recovery.
+states, random noise, sampler trajectory (`z_t`, previous prediction, number of
+steps), or generator seed enter recovery.
 
 ## Constraints and identifiability
 
@@ -121,7 +129,9 @@ solver.
 Random starts draw hypothetical normalized encoder states from
 `N(0, prompt_init_std² I)` and push them through `Gamma`; this is an explicit
 heuristic, not an estimated encoder distribution. Generation starts draw from
-ELF's raw Gaussian noise law and push through `A`. Projected noise has mean `c`
+ELF's raw Gaussian noise law and push through `A`; at a later call, they push
+`[(1 - t) g, 0]` (the noise share of `z_t`, zero previous prediction) through
+`[Wz; Ws] W1`, also a heuristic. Projected noise has mean `c`
 and covariance `noise_scale² A.T A`, **not** identity covariance.
 
 ## Solver

@@ -57,7 +57,7 @@ import elf_inversion
 
 from .backbone.solver import SolverConfig
 from .model.adapter import ELFAdapter
-from .observation import ForwardMismatch, prompt_tokens
+from .observation import SAMPLING_STEPS, ForwardMismatch, prompt_tokens
 from .pipeline import InversionResult, invert_prompt
 from .progress import ProgressLogger
 from .runs import (append_result, canonical, digest, file_sha256, json_safe, locked_directory,
@@ -65,7 +65,8 @@ from .runs import (append_result, canonical, digest, file_sha256, json_safe, loc
 from .tokens.attack import AttackConfig
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SYNTHETIC_KEYS = {"observation_layer", "noise_seed", "self_cond_cfg_scale", "attention_mask"}
+SYNTHETIC_KEYS = {"observation_layer", "noise_seed", "self_cond_cfg_scale", "attention_mask", "time",
+                  "sampling_steps"}
 RESULT_KEY = ("example_id", "repetition")
 # Noise seeds tried per (prompt, repetition) before it is skipped for a Stage A forward mismatch.
 NOISE_ATTEMPTS = 3
@@ -116,7 +117,9 @@ def generation_options(synthetic):
     return {"observation_layer": synthetic["observation_layer"],
             "noise_seed": synthetic.get("noise_seed", 100),
             "self_cond_cfg_scale": synthetic.get("self_cond_cfg_scale", 1.0),
-            "attention_mask": synthetic.get("attention_mask")}
+            "attention_mask": synthetic.get("attention_mask"),
+            "time": synthetic.get("time", 0.0),
+            "sampling_steps": synthetic.get("sampling_steps", SAMPLING_STEPS)}
 
 
 def inversion_options(config, progress_interval):

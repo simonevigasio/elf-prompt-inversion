@@ -25,6 +25,8 @@ import numpy as np
 from .backbone.forward import BackboneForward, ForwardMetadata
 
 HIDDEN_STATE, METADATA, TRUTH = "hidden_state.npy", "observation.json", "truth.npz"
+# Steps of the uniform schedule a later-pass observation is sampled on (ELF's sampling configs use 64).
+SAMPLING_STEPS = 64
 
 
 @dataclass(frozen=True)
@@ -66,9 +68,32 @@ def prompt_tokens(adapter, prompt=None, token_ids=None):
     return tokens
 
 
-def observe(adapter, tokens, metadata: ForwardMetadata, *, noise_seed=100):
-    """Run ELF's native first sampling pass and capture the hidden state.
+def schedule_steps(time, sampling_steps):
+    """ELF's uniform schedule ``linspace(0, 1, sampling_steps + 1)`` and the index of ``time`` on it."""
+    if type(sampling_steps) is not int or sampling_steps < 1:
+        raise ValueError("sampling_steps must be an integer >= 1")
+    steps = np.asarray(jnp.linspace(0.0, 1.0, sampling_steps + 1))
+    k = int(np.argmin(np.abs(steps - time)))
+    if abs(steps[k] - time) > 1e-6 or k == sampling_steps:
+        raise ValueError(f"time {time} is not a sampler call of the uniform {sampling_steps}-step schedule "
+                         f"(k / {sampling_steps} for k = 0 ... {sampling_steps - 1})")
+    return steps, k
 
+
+def _apply_with_mask(adapter, attention_mask):
+    def apply_fn(variables, x, t, **kwargs):
+        if attention_mask is not None:
+            kwargs["attention_mask"] = jnp.asarray(attention_mask)[None, :]
+        return adapter.model.apply(variables, x, t, **kwargs)
+    return apply_fn
+
+
+def observe(adapter, tokens, metadata: ForwardMetadata, *, noise_seed=100, sampling_steps=SAMPLING_STEPS):
+    """Run ELF's native sampler up to the observed call and capture its hidden state.
+
+    A "sampling_pass" at time t first takes ELF's native Euler ODE steps from 0 to t
+    on the uniform ``sampling_steps`` schedule (conditional calls only, no external
+    CFG), carrying z_t and the previous prediction exactly as the sampler does.
     Returned codes are for post-hoc scoring only; recover() never accepts them.
     """
     forward = BackboneForward(adapter, metadata)  # validates the declared layout
@@ -77,7 +102,17 @@ def observe(adapter, tokens, metadata: ForwardMetadata, *, noise_seed=100):
         raise ValueError("One synthetic example at a time")
     c = adapter.encode_text(batch)
     noise = jax.random.normal(jax.random.PRNGKey(noise_seed), c.shape) * adapter.config.denoiser_noise_scale
-    z = adapter.native["sampling"].restore_cond(noise, c, batch.cond_seq_mask)
+    sampling = adapter.native["sampling"]
+    z = sampling.restore_cond(noise, c, batch.cond_seq_mask)
+    x_pred = None
+    if metadata.forward_mode == "sampling_pass":
+        steps, k = schedule_steps(metadata.time, sampling_steps)
+        x_pred = sampling.restore_cond(jnp.zeros_like(z), c, batch.cond_seq_mask)
+        step_apply = _apply_with_mask(adapter, metadata.attention_mask)
+        for i in range(k):
+            z, x_pred = sampling._ode_step(
+                step_apply, adapter.model_params, z, jnp.asarray(steps[i]), jnp.asarray(steps[i + 1]), x_pred,
+                adapter.config, 1.0, metadata.self_cond_cfg_scale, c, batch.cond_seq_mask)
     captured = {}
 
     def intercept(next_fun, args, kwargs, context):
@@ -98,7 +133,7 @@ def observe(adapter, tokens, metadata: ForwardMetadata, *, noise_seed=100):
 
     with jax.disable_jit(), nn.intercept_methods(intercept):
         adapter.native["sampling"]._forward_sample_self_cond(
-            apply_fn, adapter.model_params, z, jnp.asarray([metadata.time]), None,
+            apply_fn, adapter.model_params, z, jnp.asarray([metadata.time]), x_pred,
             adapter.config, metadata.self_cond_cfg_scale, c, batch.cond_seq_mask)
     state = captured["state"]
     layer = metadata.observation_layer
@@ -110,15 +145,22 @@ def observe(adapter, tokens, metadata: ForwardMetadata, *, noise_seed=100):
 
 
 def generate(adapter, tokens, *, observation_layer, noise_seed=100, self_cond_cfg_scale=1.0,
-             attention_mask=None):
+             attention_mask=None, time=0.0, sampling_steps=SAMPLING_STEPS):
     """Synthetic observation for ``tokens``, checked against Stage A's forward map.
 
+    ``time`` 0 observes the first sampling pass. A later time must be a step
+    ``k / sampling_steps`` of the uniform schedule; it observes that sampler call.
     Returns an Observation (with truth) and the adapter resized to the prompt.
     """
     adapter = adapter.with_prompt_length(len(tokens))
-    metadata = ForwardMetadata(len(tokens), observation_layer, self_cond_cfg_scale=self_cond_cfg_scale,
-                               attention_mask=None if attention_mask is None else tuple(attention_mask))
-    truth = observe(adapter, tokens, metadata, noise_seed=noise_seed)
+    later = time != 0.0
+    if later:
+        steps, k = schedule_steps(time, sampling_steps)
+        time = float(steps[k])  # exactly the float32 time the sampler passes
+    metadata = ForwardMetadata(len(tokens), observation_layer, time=time, self_cond_cfg_scale=self_cond_cfg_scale,
+                               attention_mask=None if attention_mask is None else tuple(attention_mask),
+                               forward_mode="sampling_pass" if later else "first_sampling_pass")
+    truth = observe(adapter, tokens, metadata, noise_seed=noise_seed, sampling_steps=sampling_steps)
     # Stage A's forward must reproduce the native observation from the true codes.
     forward = BackboneForward(adapter, metadata)
     reconstructed = jax.jit(forward)(forward.coordinates(truth.prompt_code, truth.noise_code))
@@ -131,7 +173,8 @@ def generate(adapter, tokens, *, observation_layer, noise_seed=100, self_cond_cf
                                    err_msg="Stage A forward does not reproduce the native observation")
     except AssertionError as error:
         raise ForwardMismatch(str(error), noise_seed, float(np.max(np.abs(difference)))) from None
-    generator = {"noise_seed": noise_seed, "forward_equivalence": {
+    generator = {"noise_seed": noise_seed, **({"sampling_steps": sampling_steps, "schedule": "uniform"}
+                                              if later else {}), "forward_equivalence": {
         "absolute_residual": float(np.linalg.norm(difference)),
         "maximum_absolute_error": float(np.max(np.abs(difference)))}}
     observation = Observation(np.asarray(truth.observation), metadata, {

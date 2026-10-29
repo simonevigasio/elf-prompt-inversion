@@ -1,4 +1,4 @@
-"""ELF-specific, first-sampling-pass forward map. No example secrets live here."""
+"""ELF-specific forward map of one conditional sampler call. No example secrets live here."""
 from dataclasses import dataclass, fields
 
 import flax.linen as nn
@@ -13,16 +13,20 @@ class ForwardMetadata:
 
     prompt_length: int
     observation_layer: int = 1
-    # Only the first sampling pass is supported, so time must be 0.0.
+    # Sampler time of the observed call: 0.0 for the first pass, in [0, 1) for any pass.
     time: float = 0.0
     # Self-conditioning guidance scale the sampler passes to the backbone; it
     # enters the hidden state through the scale-token embedding.
     self_cond_cfg_scale: float = 1.0
     attention_mask: tuple[int, ...] | None = None
-    # Which sampler call produced the observation. Only "first_sampling_pass"
-    # (time 0, zero previous prediction) is supported; saving it keeps
-    # observation files explicit about the pass they come from.
+    # Which sampler call produced the observation, saved so observation files are
+    # explicit about it. "first_sampling_pass": time 0, generation inputs [g, 0].
+    # "sampling_pass": any step at a known time; the generation inputs [z_t, x_pred_prev]
+    # are both unknown. Prompt inputs are the clean [C, C] in both modes.
     forward_mode: str = "first_sampling_pass"
+
+
+FORWARD_MODES = ("first_sampling_pass", "sampling_pass")
 
 
 def validate_metadata(adapter, metadata: ForwardMetadata):
@@ -30,8 +34,12 @@ def validate_metadata(adapter, metadata: ForwardMetadata):
     model = adapter.model
     if model is None or adapter.model_params is None:
         raise ValueError("Stage A requires the frozen backbone checkpoint")
-    if metadata.forward_mode != "first_sampling_pass" or metadata.time != 0.0:
-        raise ValueError("Only first_sampling_pass at time=0 with zero previous prediction is supported")
+    if metadata.forward_mode not in FORWARD_MODES:
+        raise ValueError(f"forward_mode must be one of {FORWARD_MODES}")
+    if metadata.forward_mode == "first_sampling_pass" and metadata.time != 0.0:
+        raise ValueError("first_sampling_pass requires time=0; use sampling_pass for later steps")
+    if not (np.isfinite(metadata.time) and 0.0 <= metadata.time < 1.0):
+        raise ValueError("time must lie in [0, 1)")
     if not np.isfinite(metadata.self_cond_cfg_scale):
         raise ValueError("self_cond_cfg_scale must be finite")
     if type(metadata.observation_layer) is not int or not 0 <= metadata.observation_layer <= model.depth:
@@ -77,7 +85,10 @@ class BackboneForward:
         self.prefix_length = model.num_time_tokens + model.num_self_cond_cfg_tokens + model.num_model_mode_tokens
         wb, sc = adapter._projection_params()
         self.prompt_map = adapter.gamma
-        self.noise_map = sc["kernel"][:model.text_encoder_dim] @ wb
+        # Generation rows: first pass [g, 0] reaches g Wz W1; a later pass [z_t, x_pred_prev]
+        # reaches the row space of the whole self-conditioning kernel, [Wz; Ws] W1.
+        first_pass = metadata.forward_mode == "first_sampling_pass"
+        self.noise_map = (sc["kernel"][:model.text_encoder_dim] if first_pass else sc["kernel"]) @ wb
         self.bias = adapter.projection_bias
         self.prompt_basis, ps, pc = row_basis(self.prompt_map)
         self.noise_basis, gs, gc = row_basis(self.noise_map)
@@ -163,7 +174,9 @@ class BackboneForward:
 
         N(0,prompt_std² I) in normalized encoder space is an explicit heuristic
         for C, not a learned/empirical encoder prior. Noise follows ELF's actual
-        first-pass law N(0, denoiser_noise_scale² I) before projection.
+        first-pass law N(0, denoiser_noise_scale² I) before projection. A later
+        pass starts from the noise share of z_t, (1 - t) times that draw, with a
+        zero previous prediction: a heuristic, since z_t and x_pred_prev are unknown.
         """
         if not np.isfinite(prompt_std) or prompt_std < 0:
             raise ValueError("prompt_std must be finite and nonnegative")
@@ -171,6 +184,8 @@ class BackboneForward:
         d = self.adapter.model.text_encoder_dim
         c = jax.random.normal(pk, (1, self.n, d)) * prompt_std
         z = jax.random.normal(gk, (1, self.length - self.n, d)) * self.adapter.config.denoiser_noise_scale
+        if self.metadata.forward_mode == "sampling_pass":
+            z = jnp.concatenate([(1.0 - self.metadata.time) * z, jnp.zeros_like(z)], axis=-1)
         return self.coordinates(c @ self.prompt_map + self.bias, z @ self.noise_map + self.bias)
 
     def algebraic(self, observation):
