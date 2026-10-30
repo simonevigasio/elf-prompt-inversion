@@ -30,3 +30,4 @@ checkpoint_*/
 
 # Vim swap files
 *.swp
+*.swo
