@@ -99,6 +99,7 @@ class BackboneForward:
             "prompt_rank": self.prompt_rank, "noise_rank": self.noise_rank,
             "prompt_singular_values": ps.tolist(), "noise_singular_values": gs.tolist(),
             "prompt_rank_cutoff": float(pc), "noise_rank_cutoff": float(gc),
+            "latent_parameterization": "affine_bottleneck_row_space"
         }
         self.proj2 = adapter.model_params["text_proj"]["proj2"]
         self._prefix = self._make_prefix()

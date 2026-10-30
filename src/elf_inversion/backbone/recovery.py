@@ -1,6 +1,6 @@
 """Stage A recovery: random restarts, structured result, Stage B target.
 
-Accepts only the observation, the frozen model and declared metadata.
+Accepts only the observation, and a frozen model equivalent to a specific map.
 """
 from dataclasses import dataclass
 from time import perf_counter
@@ -9,8 +9,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from .forward import BackboneForward, ForwardMetadata
 from .solver import NumericalResult, SolverConfig, levenberg_marquardt, relative_residual
+from .interface import ForwardMap
 
 
 @dataclass(frozen=True)
@@ -64,7 +64,7 @@ def _numerical_restarts(forward, y, config, progress):
     return results
 
 
-def recover(observation, adapter, metadata: ForwardMetadata, config=SolverConfig(), *, progress=None):
+def recover(observation, forward: ForwardMap, config=SolverConfig(), *, progress=None):
     """Recover from H, weights, and public metadata only; independent random starts.
 
     There is deliberately no ground-truth-initialization argument. Diagnostic
@@ -73,7 +73,6 @@ def recover(observation, adapter, metadata: ForwardMetadata, config=SolverConfig
     ``progress(event, message, **fields)`` optionally reports restarts and LM iterations.
     """
     start = perf_counter()
-    forward = BackboneForward(adapter, metadata)
     y = jnp.asarray(observation, dtype=jnp.float32)
     if y.shape != forward.observation_shape or not np.isfinite(np.asarray(y)).all():
         raise ValueError(f"Expected finite observation with shape {forward.observation_shape}")
@@ -100,5 +99,4 @@ def recover(observation, adapter, metadata: ForwardMetadata, config=SolverConfig
         result.relative_residual, result.converged, result.stop_reason, result.iterations,
         sum(r.iterations for r in candidates), perf_counter() - start,
         summaries[best]["seed"], best, method,
-        {**forward.rank_diagnostics, "restarts": summaries,
-         "latent_parameterization": "affine_bottleneck_row_space", "regularization": "none"})
+        {**forward.rank_diagnostics, "restarts": summaries, "regularization": "none"})

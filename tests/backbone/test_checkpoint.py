@@ -29,7 +29,7 @@ class CheckpointTests(unittest.TestCase):
             prediction = jax.jit(forward)(forward.coordinates(truth.prompt_code, truth.noise_code))
             np.testing.assert_allclose(prediction, truth.observation, atol=1e-4, rtol=1e-4)
             if layer == 0:
-                result = recover(truth.observation, adapter, metadata, SolverConfig(restarts=1))
+                result = recover(truth.observation, BackboneForward(adapter, metadata), SolverConfig(restarts=1))
                 self.assertTrue(result.converged)
                 np.testing.assert_allclose(result.stage_b_target, truth.prompt_code, atol=1e-4, rtol=1e-4)
 

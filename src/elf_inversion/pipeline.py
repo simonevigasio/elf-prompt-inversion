@@ -18,6 +18,7 @@ import numpy as np
 
 from .backbone.recovery import RecoveryResult, recover
 from .backbone.solver import SolverConfig
+from .backbone.forward import BackboneForward
 from .tokens.attack import AttackConfig
 from .tokens.search import SearchResult, search as search_tokens
 
@@ -55,7 +56,7 @@ def run_stages(observation, adapter, metadata, solver_config=SolverConfig(), att
         raise ValueError("Stage A supplies projected targets only; encoder inversion is nonunique")
     report = progress or (lambda *args, **kwargs: None)
     report("stage_a_start", f"Stage A: inverting the hidden state after {metadata.observation_layer} block(s)")
-    recovered = recover(observation, adapter, metadata, solver_config, progress=progress)
+    recovered = recover(observation, BackboneForward(adapter, metadata), solver_config, progress=progress)
     report("stage_a_done", f"Stage A finished: {recovered.method}, converged={recovered.converged} "
            f"({recovered.stop_reason}), residual {recovered.absolute_residual:.6g}, "
            f"{recovered.runtime_seconds:.0f}s", converged=recovered.converged,

@@ -21,8 +21,8 @@ class RecoveryTests(unittest.TestCase):
         metadata = ForwardMetadata(1, 1)
         truth = observe(self.adapter, [4], metadata)
         config = SolverConfig(restarts=3, max_iterations=0, seed=10)
-        first = recover(truth.observation, self.adapter, metadata, config)
-        second = recover(truth.observation, self.adapter, metadata, config)
+        first = recover(truth.observation, BackboneForward(self.adapter, metadata), config)
+        second = recover(truth.observation, BackboneForward(self.adapter, metadata), config)
         np.testing.assert_array_equal(first.coordinates, second.coordinates)
         values = [r["absolute_residual"] for r in first.diagnostics["restarts"]]
         self.assertEqual(first.selected_restart, int(np.argmin(values)))
@@ -37,7 +37,7 @@ class RecoveryTests(unittest.TestCase):
         truth = observe(adapter, [4], metadata)
         f = BackboneForward(adapter, metadata)
         self.assertIsNone(f.algebraic(truth.observation))
-        result = recover(truth.observation, adapter, metadata, SolverConfig(restarts=1))
+        result = recover(truth.observation, BackboneForward(adapter, metadata), SolverConfig(restarts=1))
         self.assertTrue(result.converged)
         self.assertEqual(result.method, "levenberg_marquardt")
         self.assertFalse(np.allclose(result.prompt_code, truth.prompt_code))
@@ -46,11 +46,11 @@ class RecoveryTests(unittest.TestCase):
         metadata = ForwardMetadata(1, 0)
         truth = observe(self.adapter, [4], metadata)
         changed = truth.observation.at[:, 0].add(1)
-        result = recover(changed, self.adapter, metadata)
+        result = recover(changed, BackboneForward(self.adapter, metadata))
         self.assertFalse(result.converged)
         self.assertEqual(result.stop_reason, "inconsistent_layer_zero_observation")
         with self.assertRaises(ValueError):
-            recover(truth.observation[:, :-1], self.adapter, metadata)
+            recover(truth.observation[:, :-1], BackboneForward(self.adapter, metadata))
 
 
 if __name__ == "__main__":
