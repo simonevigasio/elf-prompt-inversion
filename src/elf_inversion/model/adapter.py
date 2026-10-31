@@ -7,7 +7,7 @@ and checkpoint configuration. Generic pretrained T5 weights are never loaded.
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import importlib
 import os
 from pathlib import Path
@@ -174,6 +174,14 @@ class PromptBatch:
     def editable_positions(self):
         """(batch index, sequence index) pairs; special tokens/suffix are excluded."""
         return np.argwhere(np.asarray(self.editable_mask))
+
+    def with_prompt_ids(self, ids) -> PromptBatch:
+        # jit-safe: Repeat the ORIGINAL layout, including fixed special tokens and suffix.
+        fields = {name: jnp.repeat(getattr(self, name), ids.shape[0], axis=0)
+                  for name in ("input_ids", "encoder_attention_mask", "attention_mask",
+                               "cond_seq_mask", "editable_mask")}
+        fields["input_ids"] = fields["input_ids"].at[:, :self.prompt_length].set(ids)
+        return replace(self, **fields)
 
 
 class ELFAdapter:
@@ -407,3 +415,6 @@ class ELFAdapter:
         if prediction.shape != target.shape:
             raise ValueError("Target shape must exactly match the prompt representation")
         return jnp.mean(jnp.square(prediction - jax.lax.stop_gradient(target)))
+
+    def target_dimension(self, mode) -> int:
+        return self.encoder.config.d_model if mode == "encoder" else self.config.bottleneck_dim

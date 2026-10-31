@@ -108,3 +108,6 @@ class TinyModel:
 
     def target(self, tokens, mode="encoder"):
         return self.encode_token_ids(self.prepare_token_ids(tokens), mode)
+
+    def target_dimension(self, mode) -> int:
+        return self.encoder.config.d_model if mode == 'encoder' else self.config.bottleneck_dim

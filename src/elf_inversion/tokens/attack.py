@@ -4,7 +4,7 @@ One attack handles one prompt. Targets are [1, length, dimension] (or
 [length, dimension]); mode is explicit and used for every loss and gradient.
 No ground-truth tokens are accepted by this module.
 """
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from itertools import islice
 from time import perf_counter
 from typing import Iterable, Literal
@@ -16,7 +16,7 @@ import numpy as np
 from ..progress import duration
 
 from .data import allowed_vocabulary, single_prompt
-
+from .interface import PromptLayout, TokenModel
 
 @dataclass(frozen=True)
 class AttackConfig:
@@ -174,35 +174,30 @@ def _strict_improvement(current, candidate, config):
 
 
 class _Evaluator:
-    def __init__(self, model, target, batch, mode):
+    def __init__(self, model: TokenModel, target, batch: PromptLayout, mode):
         self.mode = mode
         self.model, self.batch = model, batch
         target = jnp.asarray(target)
         if target.ndim == 2:
             target = target[None, ...]
-        dimension = model.encoder.config.d_model if mode == "encoder" else model.config.bottleneck_dim
+        dimension = model.target_dimension(mode)
         if target.shape != (1, batch.prompt_length, dimension):
             raise ValueError("Target shape must match the selected mode and single prompt layout")
         if not np.isfinite(np.asarray(target)).all():
             raise ValueError("Target must be finite")
         target = jax.lax.stop_gradient(target)
 
-        def layout(ids):
-            # Repeat the ORIGINAL layout, including fixed special tokens and suffix.
-            fields = {name: jnp.repeat(getattr(batch, name), ids.shape[0], axis=0)
-                      for name in ("input_ids", "encoder_attention_mask", "attention_mask",
-                                   "cond_seq_mask", "editable_mask")}
-            fields["input_ids"] = fields["input_ids"].at[:, :batch.prompt_length].set(ids)
-            return replace(batch, **fields)
+        def _mse(pred, target): 
+            return jnp.mean(jnp.square(pred - target), axis=(1, 2))
 
         def losses(ids):
-            prediction = model.encode_token_ids(layout(ids), mode=mode)
-            return jnp.mean(jnp.square(prediction - target), axis=(1, 2))
+            prediction = model.encode_token_ids(batch.with_prompt_ids(ids) , mode=mode)
+            return _mse(prediction, target)
 
         def gradient(ids):
-            current_batch = layout(ids)
+            current_batch = batch.with_prompt_ids(ids)
             inputs = model.input_embeddings(current_batch)
-            return jax.grad(lambda x: model.reconstruction_loss(x, current_batch, target, mode=mode))(inputs)
+            return jax.grad(lambda x: _mse(model.encode_embeddings(x, current_batch, mode), target).mean())(inputs)
 
         self._losses = jax.jit(losses)
         self._gradient = jax.jit(gradient)
@@ -331,7 +326,7 @@ def _stop_reason(loss, positions, shortlist_size, counters, config):
     return None
 
 
-def attack(target_codes, initial_tokens, model, config: AttackConfig = AttackConfig(), *, progress=None) -> AttackResult:
+def attack(target_codes, initial_tokens, model: TokenModel, config: AttackConfig = AttackConfig(), *, progress=None) -> AttackResult:
     """Run greedy search without any oracle information.
 
     Candidate budget counts sequences (including optional diagnostics), not batches;

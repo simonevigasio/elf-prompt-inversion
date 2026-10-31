@@ -13,6 +13,7 @@ import numpy as np
 
 from .attack import AttackConfig, AttackResult, attack
 from .data import allowed_vocabulary
+from .interface import TokenModel
 
 
 @dataclass(frozen=True)
@@ -41,7 +42,7 @@ def random_start(model, prompt_length, seed, allowed_token_ids=None):
     return np.random.default_rng(seed).choice(allowed, size=prompt_length)
 
 
-def search(target_codes, model, config: AttackConfig = AttackConfig(), *, start_tokens=None,
+def search(target_codes, model: TokenModel, config: AttackConfig = AttackConfig(), *, start_tokens=None,
            progress=None) -> SearchResult:
     """Run ``config.restarts`` attacks on ``target_codes`` and select the lowest final loss.
 
